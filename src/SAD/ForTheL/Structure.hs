@@ -66,7 +66,7 @@ procParseInstruction text = case text of
       | null syms || null (tail syms) = return ()
       | otherwise = MS.modify $ \st -> st {strSyms = syms : strSyms st}
 
-topsection = signature <|> definition <|> axiom <|> theorem
+topsection = signature </> definition </> axiom </> theorem
 
 --- generic topsection parsing
 
@@ -88,24 +88,69 @@ header titles = finish $ markupTokenOf topsectionHeader titles >> optLL1 "" topI
 -- topsections
 
 signature =
-  let sigext = pretype $ pretypeSentence Posit sigExtend defVars noLink
+  let sigext = pretype $ pretypeSentence Posit sigExtend defVars endEnvironment
   in  genericTopsection Signature sigH sigext
+    where sigH = markupTokenOf topsectionHeader ["begin"] 
+            >> smTokenOf "{" 
+            >> wdToken "signature" 
+            >> smTokenOf "}" 
+            >> return ""
+          endEnvironment = smTokenOf "."
+            >> wdToken "end"
+            >> smTokenOf "{"
+            >> wdToken "signature"
+            >> smTokenOf "}"
+            >> return []
+            
 definition =
-  let define = pretype $ pretypeSentence Posit defExtend defVars noLink
+  let define = pretype $ pretypeSentence Posit defExtend defVars endEnvironment
   in  genericTopsection Definition defH define
+    where defH = markupTokenOf topsectionHeader ["begin"] 
+            >> smTokenOf "{" 
+            >> wdToken "definition" 
+            >> smTokenOf "}" 
+            >> return ""
+          endEnvironment = smTokenOf "."
+            >> wdToken "end"
+            >> smTokenOf "{"
+            >> wdToken "definition"
+            >> smTokenOf "}"
+            >> return []
 axiom =
-  let posit = pretype $
-        pretypeSentence Posit (affH >> statement) affirmVars noLink
+  let posit = pretype $ pretypeSentence Posit (affH >> statement) affirmVars endEnvironment
   in  genericTopsection Axiom axmH posit
+    where axmH = markupTokenOf topsectionHeader ["begin"] 
+            >> smTokenOf "{" 
+            >> wdToken "axiom" 
+            >> smTokenOf "}" 
+            >> return ""
+          endEnvironment = smTokenOf "."
+            >> wdToken "end"
+            >> smTokenOf "{"
+            >> wdToken "axiom"
+            >> smTokenOf "}"
+            >> return []
 theorem = 
-  let topAffirm = pretypeSentence Affirmation (affH >> statement) affirmVars link
+  let topAffirm = pretypeSentence Affirmation (affH >> statement) affirmVars link'
   in  genericTopsection Theorem thmH (topProof topAffirm)
+    where thmH = markupTokenOf topsectionHeader ["begin"] 
+            >> smTokenOf "{" 
+            >> wdTokenOf ["theorem", "lemma", "corollary", "proposition"]
+            >> smTokenOf "}" 
+            >> return ""
+          link' = after eqLink 
+            (smTokenOf "."
+            >> wdToken "end"
+            >> smTokenOf "{"
+            >> wdTokenOf ["theorem", "lemma", "corollary", "proposition"]
+            >> smTokenOf "}"
+            >> return [])
     
 
-sigH = header ["signature"]
-defH = header ["definition"]
-axmH = header ["axiom"]
-thmH = header ["theorem", "lemma", "corollary", "proposition"]
+-- sigH = header ["signature"]
+-- defH = header ["definition"]
+-- axmH = header ["axiom"]
+-- thmH = header ["theorem", "lemma", "corollary", "proposition"]
 
 
 -- low-level
@@ -241,17 +286,25 @@ affirmVars = overfree
 
 data Scheme = None | Short | Raw | InS | InT Formula deriving Show
 
+-- preMethod generates prover instruction
+-- to be put into the resulting block;
+-- [[let us | we can] (prove | show | demonstrate) 
+-- [by (contradiction | case analysis | induction [on *sTerm*])] that]
 preMethod = optLLx None $ letUs >> dem >> after method that
   where
     dem = markupTokenOf lowlevelHeader ["prove", "show", "demonstrate"]
     that = markupToken lowlevelHeader "that"
 
-postMethod = optLL1 None $ short <|> explicit
+-- postMethod generates prover instructions;
+-- (Indeed | Proof[by (contradiction | ...)].)
+postMethod = optLLx None $ short <|> explicit
   where
     short = markupToken proofStart "indeed" >> return Short
-    explicit = finish $ markupToken proofStart "proof" >> method
+    explicit = markupToken proofStart 
+                "begin" >> smTokenOf "{" >> wdToken "proof" >> smTokenOf "}" >> method
 
-method = optLL1 Raw $ markupToken byAnnotation "by" >> (contradict <|> cases <|> induction)
+method = optLL1 Raw $ expar $ 
+            markupToken byAnnotation "By" >> (contradict <|> cases <|> induction)
   where
     contradict = wdToken "contradiction" >> return Raw
     cases = wdToken "case" >> wdToken "analysis" >> return Raw
@@ -317,7 +370,7 @@ proofSentence bl = do
   return bl {Block.body = [TextBlock pbl]}
 
 proofBody bl = do
-  bs <- proofText; ls <- link
+  bs <- proofText; ls <- eqLink
   return bl {Block.body = bs, Block.link = ls ++ Block.link bl}
 
 proofText = 
@@ -328,7 +381,8 @@ proofText =
       narrow assume </>
       proof (narrow $ affirm </> choose </> llDefn) </>
       caseDestinction
-    qed = label "qed" $ markupTokenOf proofEnd ["qed", "end", "trivial", "obvious"] >> return []
+    qed = label "qed" $ markupTokenOf proofEnd ["qed", "end", "trivial", "obvious"] 
+             >> smTokenOf "{" >> wdToken "proof" >> smTokenOf "}">> return []
     instruction =
       fmap (uncurry TextDrop) instrDrop </>
       fmap (uncurry TextInstr) instr

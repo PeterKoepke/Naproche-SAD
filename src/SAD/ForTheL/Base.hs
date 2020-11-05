@@ -77,7 +77,7 @@ initFS = FState
     sn = [ ([Sm "=", Vr], zTrm (-1) "=") ]
     nt = [
       ([Wd ["function","functions"], Nm], zFun . head),
-      ([Wd ["set","sets"], Nm], zSet . head),
+      ([Wd ["class","classes"], Nm], zSet . head),
       ([Wd ["element", "elements"], Nm, Wd ["of"], Vr], \(x:m:_) -> zElem x m),
       ([Wd ["object", "objects"], Nm], zObj . head)]
     rf = [ ([Sm "[", Vr, Sm "]"], \(f:x:_) -> zApp f x)]
@@ -302,8 +302,10 @@ hidden = do
 
 var = do
   pos <- getPos
-  v <- satisfy (\s -> all isAlphaNum s && isAlpha (head s))
-  return ('x':v, pos)
+  v <- satisfy (\s -> (all isAlphaNum s && isAlpha (head s))
+                    ||(all isLetter (tail s) && head s == '\\'))
+  if head v == '\\' then return ("x"++(tail v), pos)
+    else return ("x"++v,pos)
 
 --- pretyped Variables
 
@@ -385,10 +387,11 @@ art = opt () $ wdTokenOf ["a","an","the"]
 an = wdTokenOf ["a", "an"]
 the = wdToken "the"
 iff = wdToken "iff" <|> mapM_ wdToken ["if", "and", "only", "if"]
+         <|> mapM_ wdToken ["when", "and", "only", "when"]
 that = wdToken "that"
 standFor = wdToken "denote" <|> (wdToken "stand" >> wdToken "for")
 arrow = symbol "->"
-there = wdToken "there" >> wdTokenOf ["is","exist","exists"]
+there = wdToken "there" >> wdTokenOf ["is","are","exists","exist"]
 does = opt () $ wdTokenOf ["does", "do"]
 has = wdTokenOf ["has" , "have"]
 with = wdTokenOf ["with", "of", "having"]

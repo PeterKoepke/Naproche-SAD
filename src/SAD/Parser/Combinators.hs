@@ -109,11 +109,15 @@ enclosed bg en p = do
   return ((pos1, pos2), x)
 
 -- mandatory parentheses, brackets, braces etc.
-expar, exbrk, exbrc :: Parser st a -> Parser st a
+expar, exbrk, exbrc, exbrc' :: Parser st a -> Parser st a
 expar p = snd <$> enclosed "(" ")" p
 exbrk p = snd <$> enclosed "[" "]" p
 exbrc p = snd <$> enclosed "{" "}" p
-
+exbrc' p = do
+  wdToken "&"
+  x <- p
+  symbol "/"
+  return x
 
 ---- optional parentheses
 paren :: Parser st a -> Parser st a

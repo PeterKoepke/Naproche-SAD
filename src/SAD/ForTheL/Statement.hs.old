@@ -8,8 +8,8 @@ Syntax of ForThel statements.
 
 module SAD.ForTheL.Statement (
   statement,
-  var, sVar, sTerm, anotion, basentn, digadd, gnotion,
-  single, stattr, dig, selection, setNotion, functionNotion) where
+  var, sVar, sTerm,
+  anotion, dig, selection, setNotion, functionNotion) where
 
 import SAD.ForTheL.Base
 import SAD.ForTheL.Reports (markupToken, markupTokenOf)
@@ -33,7 +33,7 @@ import Control.Monad
 
 statement = headed <|> chained
 
-headed = quStatem <|> ifThenStatem <|> (wrongStatem </> trueStatem)
+headed = quStatem <|> ifThenStatem <|> wrongStatem
   where
     quStatem = liftM2 ($) quChain statement
     ifThenStatem = liftM2 Imp
@@ -41,8 +41,6 @@ headed = quStatem <|> ifThenStatem <|> (wrongStatem </> trueStatem)
       (markupToken Reports.ifThen "then" >> statement)
     wrongStatem =
       mapM_ wdToken ["it", "is", "wrong", "that"] >> fmap Not statement
-    trueStatem =
-      mapM_ wdToken ["it", "is", "true", "that"] >> statement
 
 
 
@@ -370,18 +368,14 @@ set = label "set definition" $ symbSet <|> setOf
     setForm dcl = let nm = (Decl.name dcl, Decl.position dcl) in
       And (zSet zHole) . dAll dcl . Iff (zElem (pVar nm) zHole)
 
+
 symbSetNotation = cndSet </> finSet
   where
-    finSet = do
-      wdToken "\\{"
-      ts <- sTerm `sepByLL1` smTokenOf ","
-      wdToken "\\}"
-      h <- hidden
+    finSet = exbrc $ do
+      ts <- sTerm `sepByLL1` smTokenOf ","; h <- hidden
       return (\tr -> foldr1 Or $ map (zEqu tr) ts, h)
-    cndSet = do
-      wdToken "{"
+    cndSet = exbrc' $ do
       (tag, c, t) <- sepFrom; st <- smTokenOf ":" >> statement;
-      wdToken "}"
       vs <- freeVarPositions t; vsDecl <- mapM makeDecl vs;
       nm <- if isVar t then return $ (trName t, trPosition t) else hidden
       return (\tr -> tag $ c tr `blAnd` mbEqu vsDecl tr t st, nm)

@@ -44,7 +44,7 @@ import Debug.Trace
 
 -- definitions and signature extensions
 
-defExtend = defPredicat -|- defNotion
+defExtend = defPredicat -|- defNotion' -|- defNotion
 sigExtend = sigPredicat -|- sigNotion
 
 defPredicat = do
@@ -68,6 +68,24 @@ defNotion = do
     isEq   = is >> optLL1 () (wdToken "equal" >> wdToken "to")
     trm Trm {trName = "=", trArgs = [_,t]} = t; trm t = t
 
+defNotion' = do
+  ((n,h),u) <- wellFormedCheck (ntnVars . fst) defn; uDecl <- makeDecl u
+  return $ dAll uDecl $ Iff (Tag HeadTerm n) h
+  where
+    defn = do
+      -- (q, f) <- anotion
+      (q,f,w) <- (art >> gnotion basentn rat <|> fmap digadd primTvr) >>= single
+      is
+      (n, u) <- newNotion
+      iff
+      s <- fmap (Tag Dig) statement
+      let f' = And f s
+      let g = subst zHole (fst w) f'
+      let v = pVar u; fn = replace v (trm n)
+      h <- (fn . q) <$> dig g [v]
+      return ((n,h),u)
+    rat = fmap (Tag Dig) stattr
+    trm Trm {trName = "=", trArgs = [_,t]} = t; trm t = t
 
 
 sigPredicat = do

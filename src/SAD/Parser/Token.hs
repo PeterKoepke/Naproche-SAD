@@ -64,26 +64,58 @@ noTokens = [EOF noPos]
 tokenize :: SourcePos -> String -> [Token]
 tokenize start = posToken start False
   where
+    -- put LaTeX comments from % to end of line into a "False token"  
+    posToken pos ws s@('%':_) =
+      makeToken comment pos False False : posToken (advancesPos pos comment) ws rest
+      where (comment, rest) = break (== '\n') s
+   
+   -- drop \section commands
+    posToken pos ws s@('\\':'s':'e':'c':'t':'i':'o':'n':'{':_) =
+      makeToken sec pos False False : posToken (advancesPos pos ('a':sec)) ws (tail rest)
+      where (sec, rest) = break (== '}') s
+         
+    -- make alphanumeric tokens 
     posToken pos ws s
       | not (null lexem) =
           makeToken lexem pos ws True : posToken (advancesPos pos lexem) False rest
       where (lexem, rest) = span isLexem s
+    
+    -- make alphabetic tokens from LaTeX commands  
+    posToken pos ws ('\\':s)
+      | not (null alpha) =
+          makeToken alpha pos ws True : posToken (advancesPos pos ('\\':alpha)) False rest
+      where (alpha, rest) = span isAlpha s
+    
+    -- drop LaTeX "\\" line breaks  
+    posToken pos ws ('\\':'\\':s) =
+      posToken (advancesPos pos "\\\\") False s
 
+    -- drop LaTeX "\ " spaces
+    posToken pos ws ('\\':' ':s) =
+      posToken (advancesPos pos "\\ ") False s
+
+    -- drop whitespace
     posToken pos _ s
       | not (null white) = posToken (advancesPos pos white) True rest
       where (white, rest) = span isSpace s
+    
+    -- eliminate $-signs
+    posToken pos ws ('$':cs) =
+      posToken (advancePos pos '$') False cs
+    
+    -- eliminate other \-signs
+    posToken pos ws ('\\':cs) =
+      posToken (advancePos pos '\\') False cs
 
-    posToken pos ws s@('#':_) =
-      makeToken comment pos False False : posToken (advancesPos pos comment) ws rest
-      where (comment, rest) = break (== '\n') s
-
+    -- put character being read into singleton token
     posToken pos ws (c:cs) =
       makeToken [c] pos ws True : posToken (advancePos pos c) False cs
 
+    -- otherwise EOF
     posToken pos _ _ = [EOF pos]
 
 isLexem :: Char -> Bool
-isLexem c = isAscii c && isAlphaNum c || c == '_'
+isLexem c = isAscii c && isAlphaNum c
 
 
 -- markup reports
