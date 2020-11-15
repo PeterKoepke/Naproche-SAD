@@ -4,53 +4,56 @@ Authors: Andrei Paskevich (2001 - 2008), Steffen Frerix (2017 - 2018)
 Print proof task in TPTP syntax.
 -}
 
-{-# LANGUAGE OverloadedStrings #-}
-
 module SAD.Export.TPTP (output) where
 
-import SAD.Data.Formula (Formula(..), showTrName, TermName(..))
+
+import qualified Data.IntMap.Strict as IM
+
+import SAD.Data.Formula
 import SAD.Data.Text.Block (Block(Block))
 import qualified SAD.Data.Text.Block as Block
 import SAD.Data.Text.Context (Context(..))
-import Data.Text.Lazy (Text)
-import qualified Data.Text.Lazy as Text
-import Data.Text.Lazy.Builder (Builder)
-import qualified Data.Text.Lazy.Builder as Builder
-import SAD.Export.Representation
-import SAD.Core.SourcePos (noSourcePos)
+import SAD.Export.Base
 
-output :: [Context] -> Context -> Text
-output contexts goal = toLazyText $
-  mconcat (map (tptpForm ",hypothesis,") $ reverse contexts)
-  <> tptpForm ",conjecture," goal
+import Debug.Trace
+
+output :: Bool -> Prover -> Int -> [Context] -> Context -> String
+output red _ _ cn gl = (axs . cnj) ""
+  where
+    axs = foldr (flip (.) . tptpForm red ",hypothesis,") id cn
+    cnj = tptpForm red ",conjecture," gl
+
 
 -- Formula print
-tptpForm :: Builder -> Context -> Builder
-tptpForm s (Context fr (Block { Block.name = m } : _) _) =
-  "fof(m"
-  <> (if Text.null m then "_" else Builder.fromLazyText m)
-  <> s <> tptpTerm 0 fr <> ").\n"
-tptpForm _ _ = ""
 
-tptpTerm :: Int -> Formula -> Builder
+tptpForm :: Bool -> String -> Context -> ShowS
+tptpForm red s (Context fr (Block { Block.name = m } : _) _ g)
+          = let f = if red then g else fr in
+            showString "fof(m"
+          . showString (if null m then "_" else m)
+          . showString s . tptpTerm 0 f . showString ").\n"
+
+tptpTerm :: Int -> Formula -> ShowS
 tptpTerm d = dive
   where
-    dive (All _ f)  = buildParens $ " ! " <> binder f
-    dive (Exi _ f)  = buildParens $ " ? " <> binder f
+    dive (All _ f)  = showParen True $ showString " ! " . binder f
+    dive (Exi _ f)  = showParen True $ showString " ? " . binder f
     dive (Iff f g)  = sinfix " <=> " f g
     dive (Imp f g)  = sinfix " => " f g
     dive (Or  f g)  = sinfix " | " f g
     dive (And f g)  = sinfix " & " f g
     dive (Tag _ f)  = dive f
-    dive (Not f)    = buildParens $ " ~ " <> dive f
-    dive Top        = "$true"
-    dive Bot        = "$false"
-    dive t@Trm {trmName = TermEquality} = let [l, r] = trmArgs t in sinfix " = " l r
-    dive t@Trm {}   = Builder.fromLazyText (showTrName t) <> buildArgumentsWith dive (trmArgs t)
-    dive v@Var {}   = Builder.fromLazyText (showTrName v)
-    dive i@Ind {}   = "W" <> (Builder.fromString (show (d - 1 - indIndex i)))
-    dive ThisT      = error "SAD.Export.TPTP: Didn't expect ThisT here"
+    dive (Not f)    = showParen True $ showString " ~ " . dive f
+    dive Top        = showString "$true"
+    dive Bot        = showString "$false"
+    dive t| isEquality t = let [l, r] = trArgs t in sinfix " = " l r
+          | isTrm t = showTrName t . showArgumentsWith dive (trArgs t)
+          | isVar t = showTrName t
+          | isInd t = showChar 'W' . shows (d - 1 - trIndx t)
 
-    sinfix o f g  = buildParens $ dive f <> o <> dive g
+    sinfix o f g  = showParen True $ dive f . showString o . dive g
 
-    binder f  = "[" <> tptpTerm (succ d) (Ind 0 noSourcePos) <> "] : " <> tptpTerm (succ d) f
+    binder f  = showChar '[' . tptpTerm (succ d) (Ind 0 undefined)
+              . showString "] : " . tptpTerm (succ d) f
+
+showTrName = showString . filter (/= ':') . trName

@@ -10,18 +10,18 @@ module SAD.Prove.MESON (prove, contras, addRules) where
 import Control.Monad
 import Control.Monad.Reader
 import Data.List
-import Data.Maybe
-import qualified Data.Text.Lazy as Text
 
-import SAD.Core.Base
+import SAD.Core.Base hiding (retrieve)
 import SAD.Data.Formula
 import SAD.Prove.Unify
 import SAD.Prove.Normalize
 import SAD.Data.Text.Context (Context, MRule(MR, conclusion))
-import SAD.Helpers (notNull)
 import qualified SAD.Data.Text.Context as Context
 import qualified SAD.Data.Structures.DisTree as DT
+import SAD.Core.Reduction
 
+import Debug.Trace
+import Data.Maybe
 
 -- generate MESON rules
 contrapositives :: [Formula] -> [MRule]
@@ -93,41 +93,43 @@ solve n localRules positives negatives ancestors goal =
       fmap (sbs . ) $ solveGoals m newAncestors $ map sbs goals
 
 
-{- find out which part of a substitution is actually relevant for the
+{- find out which part of a substitution is actually relevant for the 
 current goal-}
 relevantSbs :: Formula -> (Formula -> Formula) -> (Formula -> Formula)
 relevantSbs f sb =
   let relevant = gatherUs [] $ ltAtomic f
-  in  foldr (.) id $ map (\u -> subst (sb (mkVar u)) u) relevant
+  in  foldr (.) id $ map (\u -> subst (sb (zVar u)) u) relevant
   where
-    gatherUs ls Var {varName = x@(VarU _)} | x `notElem` ls = x : ls
-    gatherUs ls t@Trm {trmArgs = tArgs} = foldl gatherUs ls tArgs
+    gatherUs ls Var {trName = x@('u':_)} | x `notElem` ls = x : ls
+    gatherUs ls t@Trm {trArgs = tArgs} = foldl gatherUs ls tArgs
     gatherUs ls _ = ls
 
 {- take care of variable names, rename if necessary. We employ two kinds of
-  names, namely VarU names and VarHole names. This makes the whole bookkeeping
+  names, namely 'u':_ names and '?':_ names. This makes the whole bookkeeping
   process a bit easier. -}
 rename :: [Formula] -> (Formula -> Formula)
 rename fs = insertU
   where
     -- find the maximal 'u'-index and convert the '?'-names to 'u'
-    insertU v@Var {varName = VarHole m} = v{varName = VarU $ Text.pack $ show(maxU + read (Text.unpack m) + 1)}
+    insertU v@Var {trName = '?':m} = v{trName = 'u':show(maxU + read m + 1)}
     insertU f = mapF insertU f
 
     maxU = myMaximum $ concatMap (foldF getU) fs
-    getU Var {varName = VarU m} = [read $ Text.unpack m]; getU f = foldF getU f
+    getU Var {trName = 'u':m} = [read m]; getU f = foldF getU f
 
-    myMaximum :: [Int] -> Int
     myMaximum [] = -1
     myMaximum ls = maximum ls
+
+{-iterative deepening -}
+deepen f n = f n `mplus` deepen f (n + 1)
 
 {- checks whether the first formula is more general than the second in the
   context of MESON this is exactly the same as match, just with 'u':_
   instead of '?':_-}
 umatch :: (MonadPlus m) => Formula -> Formula -> m (Formula -> Formula)
-umatch Var {varName = v@(VarU _)} t = return  $ subst t v
-umatch Var {varName = u} Var {varName = v} | u == v  = return id
-umatch Trm {trmArgs = ps, trmId = n} Trm {trmArgs = qs, trmId = m}
+umatch Var {trName = v@('u':_)} t = return  $ subst t v
+umatch Var {trName = u} Var {trName = v} | u == v  = return id
+umatch Trm {trArgs = ps, trId = n} Trm {trArgs = qs, trId = m}
   | n == m = pairs ps qs
   where
     pairs (p:ps) (q:qs) = do
@@ -163,7 +165,7 @@ prove n lowLevelContext positives negatives goal =
         startingRule ++
         localRules   ++
         concatMap Context.mesonRules proofContext
-  in  (notNull :: [a] -> Bool) $
+  in  not . (null :: [a] -> Bool) $
       solve 6 lowLevelRules positives negatives [] Bot
   where
     makeContrapositives _ [] = []
@@ -172,5 +174,5 @@ prove n lowLevelContext positives negatives goal =
       in  (concatMap contrapositives . transformToCNF) skf ++
           makeContrapositives nm fs
     start t
-      | isLiteral t || (isTrm t && trmName t == TermEquality) = pure $ MR [ltNeg t] Bot
+      | isLiteral t || isEquality t = pure $ MR [ltNeg t] Bot
       | otherwise = []

@@ -4,8 +4,8 @@ Authors: Steffen Frerix (2017 - 2018)
 Normalization of formulas.
 -}
 
-{-# LANGUAGE OverloadedStrings #-}
-{-# OPTIONS_GHC -fno-warn-incomplete-patterns #-}
+
+{-# LANGUAGE FlexibleContexts #-}
 
 module SAD.Prove.Normalize  (
   simplify,
@@ -17,12 +17,12 @@ module SAD.Prove.Normalize  (
   ) where
 
 import SAD.Data.Formula
-import SAD.Core.SourcePos
+
 
 import Data.List
-import qualified Data.Text.Lazy as Text
-import SAD.Data.Text.Decl
-
+import Control.Monad.State
+import Debug.Trace
+import qualified SAD.Data.Text.Decl as Decl
 
 
 
@@ -59,101 +59,120 @@ pushdown (Not Bot)       = Top
 pushdown (Not Top)       = Bot
 pushdown (Tag _ f) = pushdown f
 pushdown (Not (Tag _ f)) = pushdown (Not f)
-pushdown (All _ (Imp (Tag HeadTerm Trm {trmName = TermEquality, trmArgs = [_,t]} ) f)) =
-  pushdown $ dec $ indSubst t VarEmpty $ inst VarEmpty f
-pushdown (All _ (Iff (Tag HeadTerm eq@Trm {trmName = TermEquality, trmArgs = [_,t]}) f)) =
-  And (All (newDecl VarEmpty) (Or eq (Not f))) $ dec $ indSubst t VarEmpty $ inst VarEmpty f
+pushdown (All _ (Imp (Tag HeadTerm Trm {trName = "=", trArgs = [_,t]} ) f)) =
+  pushdown $ dec $ indSubst t "" $ inst "" f
+pushdown (All _ (Iff (Tag HeadTerm eq@Trm {trName = "=", trArgs = [_,t]}) f)) =
+  And (All (Decl.nonText "") (Or eq (Not f))) $ dec $ indSubst t "" $ inst "" f
 pushdown f = f
 
 
--- | Prenex normal form of a formula.
+-- prenex normal form
+
+pullquants :: Formula -> Formula
+pullquants (And (All x f) (All y g)) = All x (pullquants $ And f g)
+pullquants (Or  (Exi x f) (Exi y g)) = Exi x (pullquants $ Or  f g)
+pullquants (And (All x f) g) = All x (pullquants $ And f $ inc g)
+pullquants (And f (All y g)) = All y (pullquants $ And (inc f) g)
+pullquants (Or  (All x f) g) = All x (pullquants $ Or  f $ inc g)
+pullquants (Or  f (All y g)) = All y (pullquants $ Or  (inc f) g)
+pullquants (And (Exi x f) g) = Exi x (pullquants $ And f $ inc g)
+pullquants (And f (Exi y g)) = Exi y (pullquants $ And (inc f) g)
+pullquants (Or  (Exi x f) g) = Exi x (pullquants $ Or  f $ inc g)
+pullquants (Or  f (Exi y g)) = Exi y (pullquants $ Or  (inc f) g)
+pullquants f = f
+
 prenex :: Formula -> Formula
-prenex = \case
-  All x f -> All x (prenex f)
-  Exi x f -> Exi x (prenex f)
-  f `And` g -> pullQuantifiers (prenex f `And` prenex g)
-  f `Or` g  -> pullQuantifiers (prenex f `Or`  prenex g)
-  f -> f
-  where
-    pullQuantifiers :: Formula -> Formula
-    pullQuantifiers = \case
-      All x f `And` All y g -> All x (pullQuantifiers (f     `And` g))
-      Exi x f `Or`  Exi y g -> Exi x (pullQuantifiers (f     `Or` g))
-      All x f `And` g       -> All x (pullQuantifiers (f     `And` inc g))
-      f       `And` All y g -> All y (pullQuantifiers (inc f `And` g))
-      All x f `Or` g        -> All x (pullQuantifiers (f     `Or` inc g))
-      f       `Or` All y g  -> All y (pullQuantifiers (inc f `Or` g))
-      Exi x f `And` g       -> Exi x (pullQuantifiers (f     `And` inc g))
-      f       `And` Exi y g -> Exi y (pullQuantifiers (inc f `And` g))
-      Exi x f `Or` g        -> Exi x (pullQuantifiers (f     `Or` inc g))
-      f       `Or` Exi y g  -> Exi y (pullQuantifiers (inc f `Or` g))
-      f                     -> f
+prenex (All x f) = All x $ prenex f
+prenex (Exi x f) = Exi x $ prenex f
+prenex (And f g) = pullquants $ And (prenex f) (prenex g)
+prenex (Or  f g) = pullquants $ Or  (prenex f) (prenex g)
+prenex f = f
+
 
 -- Index manangement
 
--- | Increment all de Bruijn indices by one.
+{- increase all de Bruijn indices -}
 inc :: Formula -> Formula
-inc = incAbove 0
+inc = increment 0
   where
-    incAbove n = \case
-      v@Ind{indIndex = i} -> v{indIndex = if n <= i then succ i else i}
-      All x f -> All x $ incAbove (succ n) f
-      Exi x f -> Exi x $ incAbove (succ n) f
-      f -> mapF (incAbove n) f
+    increment n v@Ind {trIndx = i} = v {trIndx = if n <= i then succ i else i}
+    increment n (All x f)  = All x $ increment (succ n) f
+    increment n (Exi x f)  = Exi x $ increment (succ n) f
+    increment n f = mapF (increment n) f
 
--- | Decrement all de Bruijn indices by one.
+{- decrease de Bruijn indices -}
 dec :: Formula -> Formula
-dec = decAbove 0
+dec = decrement 0
   where
-    decAbove n = \case
-      v@Ind{indIndex = i} -> v{indIndex = if n <= i then pred i else i}
-      All x f -> All x $ decAbove (succ n) f
-      Exi x f -> Exi x $ decAbove (succ n) f
-      f -> mapF (decAbove n) f
+    decrement n v@Ind {trIndx = i} = v {trIndx = if n <= i then pred i else i}
+    decrement n (All x f)  = All x $ decrement (succ n) f
+    decrement n (Exi x f)  = Exi x $ decrement (succ n) f
+    decrement n f = mapF (decrement n) f
 
 
-indSubst :: Formula -> VariableName -> Formula -> Formula
+indSubst :: Formula -> String -> Formula -> Formula
 indSubst t v = dive t
   where
     dive t (All x f) = All x $ dive (inc t) f
     dive t (Exi x f) = Exi x $ dive (inc t) f
-    dive t Var {varName = u} | u == v = t
+    dive t Var {trName = u} | u == v = t
     dive t f = mapF (dive t) f
 
--- | Skolemization
+-- skolemization
+
+
+data SkState = SK { skolemCounter :: Int, dependencyCounter :: Int}
+
 skolemize :: Int -> Formula -> (Formula, Int)
-skolemize n f = let (sc, _, fs) = dive (n, 0, id) f in (fs, sc)
+skolemize n f =
+  let (skf, SK {skolemCounter = nsk}) = runState (skolem f) $ SK n 0
+  in  (skf, nsk)
   where
-    -- sc: skolemCounter, dc: dependencyCounter, fs: Formula visited so far
-    dive (sc, dc, fs) (All x f) = dive (sc, succ dc, fs . All x) f
-    dive (sc, dc, fs) (Exi _ f) = dive (succ sc, dc, fs) (dec $ instSk sc dc f)
-    dive (sc, dc, fs) (Or  f g) =
-      let (sc', _, fs') = dive (sc, dc, id) f in dive (sc', dc, fs . Or  fs') g
-    dive (sc, dc, fs) (And f g) =
-      let (sc', _, fs') = dive (sc, dc, id) f in dive (sc', dc, fs . And fs') g
-    dive (sc, dc, fs) f = (sc, dc, fs f)
+    skolem (All x f) = fmap (All x) $ increaseDependency >> skolem f
+    skolem (Exi _ f) = instSkolem f >>= skolem . dec
+    skolem (Or  f g) = do
+      st <- get; liftM2 Or  (skolem f) (resetDependency st >> skolem g)
+    skolem (And f g) = do
+      st <- get; liftM2 And (skolem f) (resetDependency st >> skolem g)
+    skolem f = return f
+
+    increaseDependency =
+      modify (\st -> st {dependencyCounter = succ (dependencyCounter st)})
+    resetDependency st =
+      modify (\ost -> ost { dependencyCounter = dependencyCounter st})
+
+instSkolem :: Formula -> State SkState Formula
+instSkolem f = do
+  st <- get; let nf = instSk (skolemCounter st) (dependencyCounter st) f
+  put $ st { skolemCounter = succ (skolemCounter st) }; return nf
 
 instSk :: Int -> Int -> Formula -> Formula
 instSk skolemCnt dependencyCnt = dive 0
   where
     dive d (All x f) = All x $ dive (succ d) f
     dive d (Exi x f) = Exi x $ dive (succ d) f
-    dive d Ind {indIndex = m} | d == m = skolemFunction d
+    dive d Ind {trIndx = m} | d == m = skolemFunction d
     dive d f = mapF (dive d) f
 
-    skolemFunction = mkTrm (SkolemId (skolemCnt)) (TermTask skolemCnt) . skolemArguments
-    skolemArguments d = [Ind (i + d) noSourcePos | i <- [1..dependencyCnt] ]
+    skolemFunction = zTrm skolemId skolemName . skolemArguments
+
+
+    skolemArguments d = [Ind (i + d) undefined | i <- [1..dependencyCnt] ]
+
+    skolemId = -20 - skolemCnt
+    skolemName = "tsk" ++ show skolemCnt
+
 
 
 -- specialization of formula: get rid of universal quantifiers
 
 specialize :: Formula -> Formula
-specialize = specCh (VarHole . Text.pack . show) 0
+specialize = specCh '?' 0
 
-specCh :: (Int -> VariableName) -> Int -> Formula -> Formula
-specCh mkVar = dive
+specCh :: Char -> Int -> Formula -> Formula
+specCh c = dive
   where
-    dive n (All _ f) = dive (succ n) $ inst (mkVar n) f
+    dive n (All _ f) = dive (succ n) $ inst (c:show n) f
     dive n f = f
 
 
@@ -165,11 +184,7 @@ transformToCNF = simpCNF . specialize . prenex
 simpCNF :: Formula -> [[Formula]]
 simpCNF Top = [[]]
 simpCNF Bot = []
-simpCNF f = subsumptionCheck $ filter (not . isTrivial) $ pureCNF f
-  where
-    isTrivial :: [Formula] -> Bool
-    isTrivial [] = False
-    isTrivial (l:ls) = isTop l || any (ltTwins $ ltNeg l) ls || isTrivial ls
+simpCNF f = subsumptionCheck $ filter (not . trivial) $ pureCNF f
 
 pureCNF :: Formula -> [[Formula]]
 pureCNF (And f g) = unionBy listEq (pureCNF f) (pureCNF g)
@@ -181,7 +196,6 @@ distrib :: [[Formula]] -> [[Formula]] -> [[Formula]]
 distrib ls rs = nubBy listEq $ allpairs (unionBy ltTwins) ls rs
 
 
-{-| Does every formula from the first list have an 'ltTwins' in the second? -}
 listEq :: [Formula] -> [Formula] -> Bool
 listEq [] [] = True
 listEq (l:ls) rs = case helper [] l rs of
@@ -192,6 +206,10 @@ listEq (l:ls) rs = case helper [] l rs of
     helper dmp l (r:rs) = if ltTwins l r then return $ dmp ++ rs
                           else helper (r:dmp) l rs
 listEq _ _ = False
+
+trivial :: [Formula] -> Bool
+trivial [] = False
+trivial (l:ls) = isTop l || any (ltTwins $ ltNeg l) ls || trivial ls
 
 allpairs :: (a -> b -> c) -> [a] -> [b] -> [c]
 allpairs f [] _ = []
@@ -213,9 +231,9 @@ subsumptionCheck = subs []
 -- assumption normal form
 
 assm_nf :: Formula -> [[Formula]]
-assm_nf = map (imptolist . boolSimp . specCh VarAssume 0) . splitConjuncts . impl
+assm_nf = map (imptolist . boolSimp . specCh 'i' 0) . deAnd . impl
   where
-    imptolist (Imp f g) = map ltNeg (splitConjuncts f) ++ imptolist g
+    imptolist (Imp f g) = map ltNeg (deAnd f) ++ imptolist g
     imptolist f = [f]
 
 
@@ -235,7 +253,7 @@ pullimp f = f
 ontoPrep :: Int -> Formula -> ([Formula], Int)
 ontoPrep sk f =
   let (nf, nsk) = skolemize sk $ simplify f
-      specializedF = specCh VarSkolem 0 . prenex $ nf
+      specializedF = specCh 'o' 0 . prenex $ nf
       conjuncts = leftDistribute specializedF
   in  (conjuncts, nsk)
   where
@@ -247,5 +265,5 @@ ontoPrep sk f =
 -- testing for skolem function
 
 isSkolem :: Formula -> Bool
-isSkolem Trm {trmId = SkolemId _} = True
+isSkolem Trm {trName = 't':'s':'k':_} = True
 isSkolem _ = False

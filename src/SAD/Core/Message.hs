@@ -11,13 +11,14 @@ module SAD.Core.Message (
   PIDE, pideContext, pideActive,
   initThread, exitThread, consoleThread,
   Kind (..), entityMarkup,
-  Report, ReportString, reportsString, reportString, reports, report,
-  trimString, output, error, outputMain, outputExport, outputForTheL,
+  Report, ReportText, reportsText, reportText, reports, report,
+  trimText, output, error, outputMain, outputExport, outputForTheL,
   outputParser, outputReasoner, outputThesis, outputSimplifier, outputTranslate,
   errorExport, errorParser
 ) where
 
 import Prelude hiding (error)
+import qualified Prelude (error)
 import System.Environment
 import Control.Monad
 import Data.Maybe
@@ -31,12 +32,12 @@ import qualified Data.ByteString.Char8 as Char8
 import qualified Data.ByteString.UTF8 as UTF8
 import Control.Concurrent (ThreadId)
 import qualified Control.Concurrent as Concurrent
+import Network.Socket (Socket)
 
 import SAD.Core.SourcePos (SourcePos)
 import qualified SAD.Core.SourcePos as SourcePos
-import qualified Data.Text.Lazy as Text
 
-
+import Isabelle.Library as Isabelle
 import qualified Isabelle.Properties as Properties
 import qualified Isabelle.Value as Value
 import qualified Isabelle.Markup as Markup
@@ -44,7 +45,6 @@ import qualified Isabelle.XML as XML
 import qualified Isabelle.YXML as YXML
 import qualified Isabelle.Byte_Message as Byte_Message
 import qualified Isabelle.Naproche as Naproche
-import qualified Isabelle.Library as Library
 
 
 -- PIDE thread context
@@ -59,7 +59,7 @@ defaultChannel = Char8.putStrLn . ByteString.concat
 defaultContext :: Context
 defaultContext = Context Nothing defaultChannel
 
-
+  
 -- global state
 
 type Threads = Map ThreadId Context
@@ -93,16 +93,16 @@ pideActive = isJust <$> pideContext
 
 initThread :: Properties.T -> Channel -> IO ()
 initThread props channel = do
-  updateState (\id -> Map.insert id (Context pideContext channel))
-  where
-    property parse = Properties.get_value parse props
-    pideProperty = property (\x -> guard (not $ null x) >> pure x) Naproche.naproche_pide
-    fileProperty = property Just Naproche.naproche_pos_file
-    shiftProperty = property Value.parse_int Naproche.naproche_pos_shift
+  let property parse = Properties.get_value parse props
+  let pideProperty = property proper_string Naproche.naproche_pide
+  let fileProperty = property Just Naproche.naproche_pos_file
+  let shiftProperty = property Value.parse_int Naproche.naproche_pos_shift
+  let
     pideContext =
       case (pideProperty, fileProperty, shiftProperty) of
         (Just pide, Just file, Just shift) -> Just (PIDE pide file shift)
         _ -> Nothing
+  updateState (\id -> Map.insert id (Context pideContext channel))
 
 exitThread :: IO ()
 exitThread = updateState Map.delete
@@ -141,7 +141,10 @@ posProperties PIDE{pideID, pideFile, pideShift} pos =
   (if offset <= 0 then [] else [(Markup.offsetN, Value.print_int offset)]) ++
   (if endOffset <= 0 then [] else [(Markup.end_offsetN, Value.print_int endOffset)])
   where
-    file = if Text.null $ SourcePos.sourceFile pos then pideFile else Text.unpack $ SourcePos.sourceFile pos
+    file =
+      case SourcePos.sourceFile pos of
+        "" -> pideFile
+        file -> file
     line = if null file then 0 else SourcePos.sourceLine pos
     shift i = if i <= 0 then i else i + pideShift
     offset = shift $ SourcePos.sourceOffset pos
@@ -173,10 +176,10 @@ pideMessage = Byte_Message.make_line_message . UTF8.fromString
 -- PIDE markup reports
 
 type Report = (SourcePos, Markup.T)
-type ReportString = (Report, String)
+type ReportText = (Report, String)
 
-reportsString :: [ReportString] -> IO ()
-reportsString args = do
+reportsText :: [ReportText] -> IO ()
+reportsText args = do
   context <- getContext
   when (isJust (pide context) && not (null args)) $
     channel context $ pideMessage $ YXML.string_of $
@@ -187,11 +190,11 @@ reportsString args = do
             body = if null txt then [] else [XML.Text txt]
           in XML.Elem (markup', body)) args)
 
-reportString :: SourcePos -> Markup.T -> String -> IO ()
-reportString pos markup txt = reportsString [((pos, markup), txt)]
+reportText :: SourcePos -> Markup.T -> String -> IO ()
+reportText pos markup txt = reportsText [((pos, markup), txt)]
 
 reports :: [Report] -> IO ()
-reports = reportsString . map (, "")
+reports = reportsText . map (, "")
 
 report :: SourcePos -> Markup.T -> IO ()
 report pos markup = reports [(pos, markup)]
@@ -199,8 +202,8 @@ report pos markup = reports [(pos, markup)]
 
 -- output
 
-trimString :: String -> String
-trimString = Library.trim_line
+trimText :: String -> String
+trimText = Isabelle.trim_line
 
 messageBytes :: Maybe PIDE -> String -> Kind -> SourcePos -> String -> [ByteString]
 messageBytes pide origin kind pos msg =
@@ -235,12 +238,7 @@ outputParser = output Naproche.origin_parser
 outputReasoner = output Naproche.origin_reasoner
 outputSimplifier = output Naproche.origin_simplifier
 outputThesis = output Naproche.origin_thesis
-
-outputTranslate :: Kind -> SourcePos -> String -> IO ()
 outputTranslate = output Naproche.origin_translate
 
-errorExport :: SourcePos -> String -> IO a
 errorExport = error Naproche.origin_export
-
-errorParser :: SourcePos -> String -> IO a
 errorParser = error Naproche.origin_parser

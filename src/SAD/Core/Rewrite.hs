@@ -3,42 +3,38 @@ Authors: Steffen Frerix (2017 - 2018)
 
 Term rewriting: extraction of rules and proof of equlities.
 -}
-
 {-# LANGUAGE FlexibleContexts #-}
-{-# OPTIONS_GHC -fno-warn-incomplete-patterns #-}
-{-# LANGUAGE OverloadedStrings #-}
 
-module SAD.Core.Rewrite (equalityReasoning, lpoGe) where
 
-import SAD.Core.Base
-import SAD.Core.Reason
+module SAD.Core.Rewrite (equalityReasoning) where
+
 import SAD.Core.SourcePos
 import SAD.Data.Formula
-import SAD.Data.Instr
 import SAD.Data.Rules (Rule)
-import SAD.Data.Text.Context (Context)
-import SAD.Helpers (notNull)
-
-import SAD.Export.Representation
-
-import qualified SAD.Core.Message as Message
 import qualified SAD.Data.Rules as Rule
-import qualified SAD.Data.Text.Block as Block (body, link, position)
+import SAD.Data.Text.Context (Context)
 import qualified SAD.Data.Text.Context as Context
+import qualified SAD.Data.Text.Block as Block (body, link, position)
+import SAD.Core.Base
+import qualified SAD.Core.Message as Message
+import qualified SAD.Data.Instr as Instr
+import SAD.Core.Thesis
+import SAD.Core.Reason
 
 import Data.List
+import Data.Maybe
+import qualified Data.IntMap.Strict as IM
 import qualified Data.Set as Set
 import Control.Monad.State
 import Data.Either
 import Control.Monad.Reader
-import Data.Text.Lazy (Text)
-import qualified Data.Text.Lazy as Text
+import Control.Monad
 
 
 -- Lexicographic path ordering
 
 {- a weighting to parametrize the LPO -}
-type Weighting = Text -> Text -> Bool
+type Weighting = String -> String -> Bool
 
 
 {- standard implementation of LPO -}
@@ -47,16 +43,16 @@ lpoGe w t s = twins t s || lpoGt w t s
 
 
 lpoGt :: Weighting -> Formula -> Formula -> Bool
-lpoGt w tr@Trm {trmName = t, trmArgs = ts} sr@Trm {trmName = s, trmArgs = ss} =
+lpoGt w tr@Trm {trName = t, trArgs = ts} sr@Trm {trName = s, trArgs = ss} =
    any (\ti -> lpoGe w ti sr) ts
     || (all (lpoGt w tr) ss
     && ((t == s && lexord (lpoGt w) ts ss)
-    || w (toLazyText $ represent t) (toLazyText $ represent s)))
-lpoGt w Trm { trmName = t, trmArgs = ts} v@Var {varName = x} =
-  w (toLazyText $ represent t) (toLazyText $ represent x) || any (\ti -> lpoGe w ti v) ts
-lpoGt w v@Var {varName = x} Trm {trmName = t, trmArgs = ts} =
-  w (toLazyText $ represent x) (toLazyText $ represent t) && all (lpoGt w v) ts
-lpoGt w Var{varName = x} Var {varName = y} = w (toLazyText $ represent x) (toLazyText $ represent y)
+    || w t s))
+lpoGt w Trm { trName = t, trArgs = ts} v@Var {trName = x} =
+  w t x || any (\ti -> lpoGe w ti v) ts
+lpoGt w v@Var {trName = x} Trm {trName = t, trArgs = ts} =
+  w x t && all (lpoGt w v) ts
+lpoGt w Var{trName = x} Var {trName = y} = w x y
 lpoGt _ _ _ = False
 
 
@@ -70,16 +66,16 @@ lexord _ _ _ = False
 -- simplification
 
 {- type to record conditions and intermediate steps during simplification -}
-type SimpInfo = ([Formula], Text)
+type SimpInfo = ([Formula], String)
 
 
-{- performs one simplification step. We always try to simplify in a
+{- performs one simplification step. We always try to simplify in a 
 leftmost-bottommost fashion with respect to the term structure -}
 simpstep :: [Rule] -> Weighting -> Formula -> [(Formula, SimpInfo)]
 simpstep rules w = flip runStateT undefined . dive
   where
-    dive t@Trm {trmName = tName, trmArgs = tArgs} =
-      (do newArgs <- try tArgs; return t {trmArgs = newArgs}) `mplus` applyRule t
+    dive t@Trm {trName = tName, trArgs = tArgs} =
+      (do newArgs <- try tArgs; return t {trArgs = newArgs}) `mplus` applyRule t
     dive v@Var{} = applyRule v
 
     try [] = mzero
@@ -102,7 +98,7 @@ simpstep rules w = flip runStateT undefined . dive
       guard $ full nr && lpoGt w (sbs l) nr -- simplified term must be lighter
       return (sbs r, map sbs $ Rule.condition rule, rule)
 
-    full Var {varName = VarHole _} = False; full f = allF full f
+    full Var {trName = '?':_} = False; full f = allF full f
 
 
 {- finds ALL normalforms and their corresponding simplification paths -}
@@ -117,7 +113,7 @@ findNormalform rules w t = map (reverse . (:) (t, trivialSimpInfo)) $ dive t
         (:) (simplifiedTerm, simpInfo) <$> dive simplifiedTerm
 
 
-{- finds two matching normalforms and outputs all conditions accumulated
+{- finds two matching normalforms and outputs all conditions accumulated 
 during their rewriting -}
 generateConditions ::
   Bool -> [Rule] -> Weighting -> Formula -> Formula -> VM [SimpInfo]
@@ -140,33 +136,32 @@ generateConditions verbositySetting rules w l r =
 
     -- logging and user communication
     log leftNormalForm rightNormalForm = when verbositySetting $ do
-      simpLog Message.WRITELN noSourcePos "no matching normal forms found"
+      simpLog Message.WRITELN noPos "no matching normal forms found"
       showPath leftNormalForm; showPath rightNormalForm
-    showPath ((t,_):rest) = when verbositySetting $ do
-      simpLog Message.WRITELN noSourcePos (Text.pack $ show t)
-      mapM_ (simpLog Message.WRITELN noSourcePos . format) rest
+    showPath ((t,_):rest) = when verbositySetting $
+      simpLog Message.WRITELN noPos (show t) >> mapM_ (simpLog Message.WRITELN noPos . format) rest
     -- formatting of paths
-    format (t, simpInfo) = " --> " <> Text.pack (show t) <> conditions simpInfo
+    format (t, simpInfo) = " --> " ++ show t ++ conditions simpInfo
     conditions (conditions, name) =
-      (if Text.null name then "" else " by " <> name <> ",") <>
-      (if null conditions then "" else " conditions: " <>
-        Text.unwords (intersperse "," $ map (Text.pack . show) conditions))
+      (if null name then "" else " by " ++ name ++ ",") ++
+      (if null conditions then "" else " conditions: " ++
+        unwords (intersperse "," $ map show conditions))
 
 
 {- applies computational reasoning to an equality chain -}
 equalityReasoning :: Context -> VM ()
 equalityReasoning thesis
-  | body = whenInstruction Printreason False $ reasonLog Message.WRITELN noSourcePos "eqchain concluded"
-  | notNull link = getLinkedRules link >>= rewrite equation
+  | body = whenInstruction Instr.Printreason False $ reasonLog Message.WRITELN noPos "eqchain concluded"
+  | (not . null) link = getLinkedRules link >>= rewrite equation
   | otherwise = rules >>= rewrite equation -- if no link is given -> all rules
   where
     equation = strip $ Context.formula thesis
     link = Context.link thesis
     -- body is true for the EC section containing the equlity chain
-    body = notNull $ Block.body . head . Context.branch $ thesis
+    body = (not . null) $ Block.body . head . Context.branch $ thesis
 
 
-getLinkedRules :: [Text] -> VM [Rule]
+getLinkedRules :: [String] -> VM [Rule]
 getLinkedRules link = do
   rules <- rules; let setLink = Set.fromList link
   let (linkedRules, unfoundRules) = runState (retrieve setLink rules) setLink
@@ -174,8 +169,8 @@ getLinkedRules link = do
   return linkedRules
   where
     warn st =
-      simpLog Message.WARNING noSourcePos $
-        "Could not find rules " <> Text.unwords (map (Text.pack . show) $ Set.elems st)
+      simpLog Message.WARNING noPos $
+        "Could not find rules " ++ unwords (map show $ Set.elems st)
 
     retrieve _ [] = return []
     retrieve s (c:cnt) = let nm = Rule.label c in
@@ -189,11 +184,11 @@ rules :: VM [Rule]
 rules = asks rewriteRules
 
 
-{- applies rewriting to both sides of an equation
+{- applies rewriting to both sides of an equation 
 and compares the resulting normal forms -}
 rewrite :: Formula -> [Rule] -> VM ()
-rewrite Trm {trmName = TermEquality, trmArgs = [l,r]} rules = do
-  verbositySetting <- askInstructionBool Printsimp False
+rewrite Trm {trName = "=", trArgs = [l,r]} rules = do
+  verbositySetting <- askInstructionBool Instr.Printsimp False
   conditions <- generateConditions verbositySetting rules (>) l r;
   mapM_ (dischargeConditions verbositySetting . fst) conditions
 rewrite _ _ = error "SAD.Core.Rewrite.rewrite: non-equation argument"
@@ -209,24 +204,25 @@ dischargeConditions verbositySetting conditions =
       | all isRight hardConditions =
           if all isTop $ rights hardConditions
           then return ()
-          else log $ "trivial " <> header rights hardConditions
+          else log $ "trivial " ++ header rights hardConditions
       | otherwise = do
-          log (header lefts hardConditions <> thead (rights hardConditions))
+          log (header lefts hardConditions ++ thead (rights hardConditions))
           thesis <- thesis
-          mapM_ (reason . Context.setFormula (wipeLink thesis)) (lefts hardConditions)
+          mapM_ (reason . Context.setForm (wipeLink thesis)) (lefts hardConditions)
 
     setup :: VM a -> VM a
     setup action = do
-      timelimit <- LimitBy Timelimit <$> askInstructionInt Checktime 1
-      depthlimit <- LimitBy Depthlimit <$> askInstructionInt Checkdepth 3
-      addInstruction timelimit $ addInstruction depthlimit action
+      timelimit <- Instr.Int Instr.Timelimit <$> askInstructionInt Instr.Checktime 1
+      depthlimit <- Instr.Int Instr.Depthlimit <$> askInstructionInt Instr.Checkdepth 3
+      ontored <- Instr.Bool Instr.Ontored <$> askInstructionBool Instr.Checkontored False
+      addInstruction timelimit $ addInstruction depthlimit $ addInstruction ontored action
 
-    header select conditions = "condition: " <> format (select conditions)
-    thead [] = ""; thead conditions = "(trivial: " <> format conditions <> ")"
+    header select conditions = "condition: " ++ format (select conditions)
+    thead [] = ""; thead conditions = "(trivial: " ++ format conditions ++ ")"
     format conditions =
       if   null conditions
       then " - "
-      else Text.unwords . intersperse "," . map (Text.pack . show) $ reverse conditions
+      else unwords . intersperse "," . map show $ reverse conditions
     log msg =
       when verbositySetting $ thesis >>=
         flip (simpLog Message.WRITELN . Block.position . Context.head) msg
@@ -238,4 +234,4 @@ dischargeConditions verbositySetting conditions =
     trivialityCheck g =
       if   trivialByEvidence g
       then return $ Right g  -- triviality check
-      else (launchReasoning `withGoal` g >> return (Right g)) <|> return (Left g)
+      else launchReasoning `withGoal` g >> return (Right g) <|> return (Left g)

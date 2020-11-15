@@ -4,25 +4,32 @@ Authors: Steffen Frerix (2017 - 2018)
 Generation of proof tasks.
 -}
 
-{-# LANGUAGE OverloadedStrings #-}
 
 module SAD.Core.ProofTask (generateProofTask) where
 
 import SAD.Data.Formula
-
 import SAD.Data.Text.Block (Section(..))
+import qualified SAD.Data.Text.Block as Block (position)
+import SAD.Data.Text.Context (Context)
+import qualified SAD.Data.Text.Context as Context
 import SAD.Prove.Normalize
-import Data.Set (Set)
-import qualified Data.Text.Lazy as Text
+import SAD.Core.Base
+import qualified SAD.Core.Message as Message
 
+import qualified Control.Monad.Writer as W
+import Data.List
+import Control.Monad
 import Data.Maybe
+import Debug.Trace
+import Control.Monad.State
+import Control.Monad.Trans.Reader
 
-import SAD.Data.Text.Decl
+import qualified SAD.Data.Text.Decl as Decl
 
 
 {- generate proof task associated with a block -}
 
-generateProofTask :: Section -> Set VariableName -> Formula -> Formula
+generateProofTask :: Section -> [String] -> Formula -> Formula
 generateProofTask Selection vs f = foldr mbExi f vs
 generateProofTask LowDefinition _ f
   | funDcl f = funTask f
@@ -31,40 +38,41 @@ generateProofTask _ _ f = f
 
 {- Check whether a formula is a set or function defintion -}
 funDcl, setDcl :: Formula -> Bool
-funDcl (And (And f _) _) = trmId f == FunctionId
+funDcl (And (And f _) _) = trId f == functionId
 funDcl _ = False
-setDcl (And f _) = trmId f == SetId
+setDcl (And f _) = trId f == setId
 setDcl _ = error "SAD.Core.ProofTask.setDcl: misformed definition"
 
 setTask :: Formula -> Formula
 setTask (And _ (All x (Iff _ (Tag Replacement f)))) =
-  replacement (declName x) f
+  replacement (Decl.name x) f
 setTask (And _ (All _ (Iff _ f))) = separation f
 setTask _ = error "SAD.Core.ProofTask.setTask: misformed definition"
 
 {- generate separation proof task -}
 separation :: Formula -> Formula
 separation (And f g) = separation f
-separation t | isElem t = dec $ mkSet $ last $ trmArgs t
+separation t | isElem t = dec $ zSet $ last $ trArgs t
 separation _ = error "SAD.Core.ProofTask.separation: misformed argument"
 
 {- generate replacement proof task -}
-replacement :: VariableName -> Formula -> Formula
-replacement x f = fromMaybe _default $ dive [] f
+replacement :: String -> Formula -> Formula
+replacement x f = fromJust $ dive [] f `mplus` _default
   where
-    dive vs (Exi x f) = dive (declName x:vs) f
+    dive vs (Exi x f) = dive (Decl.name x:vs) f
     dive vs (And f g) | not $ null vs =
-      let vsAlt  = map VarTask vs
-          startF = sets vsAlt `blAnd` foldr mbAll (f `blImp` elements vs vsAlt) vs
-      in  Just $ foldr mbExi startF vsAlt
-    dive _ _ = Nothing
+      let vsAlt  = map ((:) 'c') vs
+          startF =
+            sets vsAlt `blAnd` foldr mbAll (f `blImp` elements vs vsAlt) vs
+      in  return $ foldr mbExi startF vsAlt
+    dive _ _ = mzero
     _default =
-      let x2 = VarTask x; xv = mkVar x; x2v = mkVar x2
-      in  mkAll x $ Imp f $ mkExi x2 $ mkSet x2v `And` (xv `mkElem` x2v)
+      let x2 = 'c':x; xv = zVar x; x2v = zVar x2
+      in  return $ zAll x $ Imp f $ zExi x2 $ zSet x2v `And` (xv `zElem` x2v)
 
-    sets = foldr blAnd Top . map (mkSet . mkVar)
+    sets = foldr blAnd Top . map (zSet . zVar)
     elements (v1:vs) (v2:vs2) =
-      mkElem (mkVar v1) (mkVar v2) `blAnd` elements vs vs2
+      zElem (zVar v1) (zVar v2) `blAnd` elements vs vs2
     elements _ _ = Top
 
 
@@ -76,7 +84,7 @@ funTask _ = error "SAD.Core.ProofTask.funTask: misformed definition"
 
 domain :: Formula -> Formula
 domain (Tag Domain (All _ (Iff _ f))) = Tag DomainTask $ separation f
-domain (Tag Domain Trm{trmName = TermEquality, trmArgs = [_,t]}) = Tag DomainTask $ mkSet t
+domain (Tag Domain Trm{trName = "=", trArgs = [_,t]}) = Tag DomainTask $ zSet t
 domain _ = error "SAD.Core.ProofTask.domain: misformed definition"
 
 
@@ -86,12 +94,12 @@ choices = Tag ChoiceTask . dive
   where
     dive (Tag Evaluation _) = Top
     dive (Tag _ f) = dive f
-    dive (Exi dcl (And (Tag Defined f) g)) = let x = declName dcl in
-      (generateProofTask LowDefinition mempty $ dec $ inst x $ f) `blAnd`
+    dive (Exi dcl (And (Tag Defined f) g)) = let x = Decl.name dcl in 
+      (generateProofTask LowDefinition [] $ dec $ inst x $ f) `blAnd`
       (dec $ inst x $ f `blImp` dive g)
-    dive (All x f) = bool $ All x $ dive f
+    dive (All x f) = dBlAll x $ dive f
     dive (Imp f g) = f `blImp` dive g
-    dive (Exi x f) = bool $ Exi x $ dive f
+    dive (Exi x f) = dBlExi x $ dive f
     dive (And f g) = dive f `blAnd` dive g
     dive f = f
 
@@ -99,10 +107,9 @@ choices = Tag ChoiceTask . dive
 existence :: Formula -> Formula
 existence  = Tag ExistenceTask . dive 0
   where
-    dive :: Int -> Formula -> Formula
-    dive n (All x f) = let nn = VarTask $ VarDefault $ Text.pack $ show n in mkAll nn $ dive (n + 1) $ inst nn f
+    dive n (All x f) = let nn = 'c':show n in zAll nn $ dive (n + 1)$ inst nn f
     dive n (Imp f g) = blImp f $ dive n g
-    dive _ f = let y = mkVar (VarDefault "y") in mkExi (VarDefault "y") $ devReplace y $ describe_exi f
+    dive _ f = let y = zVar "y" in zExi "y" $ devReplace y $ describe_exi f
 
 
 
@@ -113,11 +120,11 @@ uniqueness = Tag UniquenessTask . dive
     dive (All x f) = All x $ dive f
     dive (Imp f g) = f `blImp` dive g
     dive f =
-      let y = mkVar $ VarDefault "y"; cy = mkVar $ VarTask $ VarDefault "y"; df = describe f
+      let y = zVar "y"; cy = zVar "cy"; df = describe f
           yf = devReplace y df; cyf = devReplace cy df
-      in  mkAll (VarDefault "y") $ mkAll (VarTask $ VarDefault "y") $ inc $ inc $ Imp (yf `And` cyf) $ mkEquality y cy
+      in  zAll "y" $ zAll "cy" $ inc $ inc $ Imp (yf `And` cyf) $ zEqu y cy
 
-{- output a description of a function in the form
+{- output a description of a function in the form 
   (condition_1 /\ evaluation_1) \/ ... \/ (condition_n /\ evaluation_n)
   choices are expressed by choice operator rather than throuth an existentially
   quantified formula -}
@@ -126,8 +133,7 @@ describe (And f g) = describe f `Or` describe g
 describe (Tag Condition (Imp f g)) = And f $ deExi g
 describe f = deExi f
 
-deExi :: Formula -> Formula
-deExi (Exi dcl (And f g)) = let x = declName dcl in
+deExi (Exi dcl (And f g)) = let x = Decl.name dcl in 
   dec $ And (inst x f) (deExi $ inst x g)
 deExi f = f
 
@@ -137,28 +143,27 @@ describe_exi (And f g) = describe_exi f `Or` describe_exi g
 describe_exi (Tag Condition (Imp f g)) = Imp f $ impExi g
 describe_exi f = impExi f
 
-impExi :: Formula -> Formula
-impExi (Exi dcl (And f g)) = let x = declName dcl in
+impExi (Exi dcl (And f g)) = let x = Decl.name dcl in
   dec $ Imp (inst x f) (impExi $ inst x g)
 impExi f = f
 
 {- a certain normalization of the term marked with Evaluation -}
 devReplace :: Formula -> Formula -> Formula
-devReplace y (Tag Evaluation eq@Trm {trmName = TermEquality, trmArgs = [_, t]}) =
-  eq {trmArgs = [y,t]}
+devReplace y (Tag Evaluation eq@Trm {trName = "=", trArgs = [_, t]}) =
+  eq {trArgs = [y,t]}
 devReplace y f = mapF (devReplace y) f
 
 {- compute domain conditions of functions -}
 domainCondition :: Formula -> Formula -> Formula
-domainCondition (Tag _ (All _ (Iff Trm {trmArgs = [_,dm]} g))) = dive
+domainCondition (Tag _ (All _ (Iff Trm {trArgs = [_,dm]} g))) = dive
   where
-    dive Trm {trmId = tId, trmArgs = [x,d]}
-      | tId == ElementId && twins d dm = subst x VarEmpty $ inst VarEmpty g
+    dive Trm {trId = tId, trArgs = [x,d]}
+      | tId == elementId && twins d dm = subst x "" $ inst "" g
     dive f = mapF dive f
-domainCondition (Tag _ Trm {trmName = TermEquality, trmArgs = [dm,g]}) = dive
+domainCondition (Tag _ Trm {trName = "=", trArgs = [dm,g]}) = dive
   where
-    dive Trm {trmId = tId, trmArgs = [x,d]}
-      | tId == ElementId && twins d dm = mkElem x g
+    dive Trm {trId = tId, trArgs = [x,d]}
+      | tId == elementId && twins d dm = zElem x g
     dive f = mapF dive f
 domainCondition _ =
   error "SAD.Core.ProofTask.domainCondition: misformed argument"

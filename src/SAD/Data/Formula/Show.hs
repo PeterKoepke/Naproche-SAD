@@ -1,22 +1,14 @@
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module SAD.Data.Formula.Show (
   showArgumentsWith,
-  commaSeparated,
+  showTailWith,
   symEncode,
   symChars
   -- also exports show instance for Formula
   )where
 
 import SAD.Data.Formula.Base
-import SAD.Data.VarName
-import SAD.Data.Terms
-import SAD.Export.Representation (toLazyText, represent)
-import SAD.Core.SourcePos (noSourcePos)
+import SAD.Data.Formula.Kit
 
-import Data.Text.Lazy (Text)
-import qualified Data.Text.Lazy as Text
 
 -- show instances
 
@@ -38,15 +30,17 @@ showFormula p d = dive
     dive Bot       = showString "contradiction"
     dive ThisT     = showString "ThisT"
 
-    dive t@Trm{trmName = TermThesis} = showString "thesis"
-    dive t@Trm{trmName = TermEquality, trmArgs = [l,r]} = showInfix " = " l r
-    dive t@Trm{trmName = TermSymbolic tName, trmArgs = tArgs} = decode (Text.unpack tName) tArgs p d
-    dive t@Trm{trmName = TermThe tName, trmArgs = tArgs} =
-          showString ("the" <> Text.unpack tName) . showArguments tArgs
-    dive t@Trm{trmName = tName, trmArgs = tArgs} = showString (Text.unpack $ toLazyText $ represent tName) . showArguments tArgs
-    dive v@Var{varName = VarConstant s} = showString (Text.unpack s)
-    dive v@Var{varName = vName} = showString $ Text.unpack $ toLazyText $ represent vName
-    dive Ind {indIndex = i }
+    dive t@Trm{trName = tName, trArgs = tArgs}
+      | isThesis t = showString "thesis"
+      | isEquality t = let [l,r] = trArgs t in showInfix " = " l r
+      | isSymbolicTerm t = decode (tail tName) tArgs p d
+      | not (null tName) && head tName == 't' =
+          showString (tail tName) . showArguments tArgs
+      | otherwise = showString tName . showArguments tArgs
+    dive v@Var{trName = vName}
+      | isUserVariable v = showString $ tail vName
+      | otherwise = showString vName
+    dive Ind {trIndx = i }
       | i < d = showChar 'v' . shows (d - i - 1)
       | otherwise = showChar 'v' . showChar '?' . showString (show i)
 
@@ -55,20 +49,23 @@ showFormula p d = dive
       let showTerm = showFormula (pred p) d
       in  showArgumentsWith showTerm ts
 
-    showBinder f = showFormula p (succ d) (Ind 0 noSourcePos) . showChar ' ' .
+    showBinder f = showFormula p (succ d) (Ind 0 undefined) . showChar ' ' .
       showFormula p (succ d) f
 
     showInfix operator f g = dive f . showString operator . dive g
 
 
 showArgumentsWith :: (a -> ShowS) -> [a] -> ShowS
-showArgumentsWith _ [] = id
-showArgumentsWith showTerm ls = showParen True $ commaSeparated showTerm ls
+showArgumentsWith showTerm (t:ts) =
+  showParen True $ showTerm t . showTailWith showTerm ts
+showArgumentsWith _ _ = id
 
-commaSeparated :: (a -> ShowS) -> [a] -> ShowS
-commaSeparated showTerm [] = id
-commaSeparated showTerm [t] = showTerm t
-commaSeparated showTerm (t:ts) = showTerm t . showChar ',' . commaSeparated showTerm ts
+showTailWith :: (a -> ShowS) -> [a] -> ShowS
+showTailWith showTerm = foldr ((.) . ((showChar ',' .) . showTerm)) id
+
+isSymbolicTerm, isUserVariable :: Formula -> Bool
+isSymbolicTerm Trm {trName = 's':_} = True; isSymbolicTerm _ = False
+isUserVariable Var {trName = 'x':_} = True; isUserVariable _ = False
 
 -- decoding of symbolic names
 
@@ -114,36 +111,35 @@ decode s (t:ts) p d = dec s
     dec _            = showString s
 
 
-    ambig Trm {trmName = TermSymbolic tName} | "dt" `Text.isPrefixOf` tName = not $ funPat (Text.drop 3 tName)
-    ambig Trm {trmName = TermSymbolic tName} =
-      snd (Text.splitAt (Text.length tName - 2) tName) == "dt"
+    ambig Trm {trName = 's':'d':'t':cs} = not $ funpatt cs
+    ambig Trm {trName = t} = 
+      head t == 's' && snd (splitAt (length t - 2) t) == "dt"
     ambig _ = False
 
-    funPat "lbdtrb" = True
-    funPat _ = False
+    funpatt "lbdtrb" = True
+    funpatt _ = False
 
 
 
 -- Symbolic names
 
-symChars :: String
+symChars :: [Char]
 symChars = "`~!@$%^&*()-+=[]{}:'\"<>/?\\|;,"
 
-symEncode :: Text -> Text
-symEncode = Text.concat . map chc . Text.chunksOf 1
+symEncode :: String -> String
+symEncode = concatMap chc
   where
-    chc :: Text -> Text
-    chc "`" = "bq" ; chc "~"  = "tl" ; chc "!" = "ex"
-    chc "@" = "at" ; chc "$"  = "dl" ; chc "%" = "pc"
-    chc "^" = "cf" ; chc "&"  = "et" ; chc "*" = "as"
-    chc "(" = "lp" ; chc ")"  = "rp" ; chc "-" = "mn"
-    chc "+" = "pl" ; chc "="  = "eq" ; chc "[" = "lb"
-    chc "]" = "rb" ; chc "{"  = "lc" ; chc "}" = "rc"
-    chc ":" = "cl" ; chc "\'" = "qt" ; chc "\"" = "dq"
-    chc "<" = "ls" ; chc ">"  = "gt" ; chc "/" = "sl"
-    chc "?" = "qu" ; chc "\\" = "bs" ; chc "|" = "br"
-    chc ";" = "sc" ; chc ","  = "cm" ; chc "." = "dt"
-    chc c   = Text.cons 'z' c
+    chc '`' = "bq" ; chc '~'  = "tl" ; chc '!' = "ex"
+    chc '@' = "at" ; chc '$'  = "dl" ; chc '%' = "pc"
+    chc '^' = "cf" ; chc '&'  = "et" ; chc '*' = "as"
+    chc '(' = "lp" ; chc ')'  = "rp" ; chc '-' = "mn"
+    chc '+' = "pl" ; chc '='  = "eq" ; chc '[' = "lb"
+    chc ']' = "rb" ; chc '{'  = "lc" ; chc '}' = "rc"
+    chc ':' = "cl" ; chc '\'' = "qt" ; chc '"' = "dq"
+    chc '<' = "ls" ; chc '>'  = "gt" ; chc '/' = "sl"
+    chc '?' = "qu" ; chc '\\' = "bs" ; chc '|' = "br"
+    chc ';' = "sc" ; chc ','  = "cm" ; chc '.' = "dt"
+    chc c   = ['z', c]
 
 symDecode :: String -> String
 symDecode s = sname [] s

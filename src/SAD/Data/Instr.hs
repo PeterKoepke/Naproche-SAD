@@ -4,46 +4,42 @@ Authors: Andrei Paskevich (2001 - 2008), Steffen Frerix (2017 - 2018), Makarius 
 Instruction datatype and core functions.
 -}
 
-{-# LANGUAGE OverloadedStrings #-}
-
 module SAD.Data.Instr where
 
-import SAD.Core.SourcePos (SourcePos, SourceRange(..), noSourcePos, noRange)
-import Data.Text.Lazy (Text)
+import Prelude hiding (Int, Bool, String, drop)
+import qualified Prelude
+import Control.Monad
+import SAD.Core.SourcePos (SourcePos, SourceRange)
+import qualified SAD.Core.SourcePos as SourcePos
 
 
 -- Position information
 
 data Pos = Pos {start :: SourcePos, stop :: SourcePos, range :: SourceRange}
-  deriving (Eq, Ord, Show)
 
 position :: Pos -> SourcePos
-position p = let SourceRange a _ = range p in a
+position = fst . range
 
 noPos :: Pos
-noPos = Pos noSourcePos noSourcePos noRange
+noPos = Pos SourcePos.noPos SourcePos.noPos SourcePos.noRange
 
 
 -- Instruction types
 
-data UnderlyingTheory = FirstOrderLogic | CiC | Lean
-  deriving (Eq, Ord, Show)
-
 data Instr =
     Command Command
-  | LimitBy Limit Int
-  | SetFlag Flag Bool
-  | GetArgument Argument Text
-  | GetArguments Arguments [Text]
-  | Theory UnderlyingTheory
-  deriving (Eq, Ord, Show)
+  | Int Int Prelude.Int
+  | Bool Bool Prelude.Bool
+  | String String Prelude.String
+  | Strings Strings [Prelude.String]
+  deriving (Show, Eq)
 
 data Drop =
     DropCommand Command
-  | DropLimit Limit
-  | DropFlag Flag
-  | DropArgument Argument
-  deriving (Eq, Ord, Show)
+  | DropInt Int
+  | DropBool Bool
+  | DropString String
+  deriving (Show, Eq)
 
 
 -- Instructions
@@ -55,16 +51,16 @@ data Command =
   | CONTEXT  -- print current context
   | FILTER   -- print simplified top-level context
   | RULES
-  deriving (Eq, Ord, Show)
+  deriving (Eq,Show)
 
-data Limit =
+data Int =
     Timelimit   -- time limit per prover launch  (3 sec)
   | Depthlimit  -- number of reasoner iterations (7)
   | Checktime   -- time limit for checker's tasks (1 sec)
   | Checkdepth  -- depth limit for checker's tasks (3)
-  deriving (Eq, Ord, Show)
+  deriving (Eq,Show)
 
-data Flag =
+data Bool =
     Prove          --  prove goals (yes)
   | Check          --  look for applicable definitions (yes)
   | Symsign        --  rename symbols with diverging defs (yes)
@@ -87,14 +83,16 @@ data Flag =
   | Server         --  server mode (comline only)
   | Printsimp      --  print simplifier log (no)
   | Printthesis    --  print thesis development (no)
+  | Ontored        --  use ontological reduction (no)
   | Unfold         --  general unfolding (on)
   | Unfoldsf       --  general unfolding of sets and functions
   | Unfoldlow      --  unfold the whole low level context (yes)
   | Unfoldlowsf    --  unfold set and function conditions in low level (no)
+  | Checkontored   --  enable ontological reduction for checks (off)
   | Translation    --  print first-order translation of sentences
-  deriving (Eq, Ord, Show)
+  deriving (Eq,Show)
 
-data Argument =
+data String =
     Init     --  init file (init.opt)
   | Text     --  literal text
   | File     --  read file
@@ -102,41 +100,38 @@ data Argument =
   | Library  --  library directory
   | Provers  --  prover database
   | Prover   --  current prover
-  deriving (Eq, Ord, Show)
+  deriving (Eq,Show)
 
-data Arguments =
+data Strings =
   Synonym
-  deriving (Eq, Ord, Show)
+  deriving (Eq,Show)
 
 -- Ask
 
-askLimit :: Limit -> Int -> [Instr] -> Int
-askLimit i d is  = head $ [ v | LimitBy j v <- is, i == j ] ++ [d]
+askInt :: Int -> Prelude.Int -> [Instr] -> Prelude.Int
+askInt i d is  = head $ [ v | Int j v <- is, i == j ] ++ [d]
 
-askFlag :: Flag -> Bool -> [Instr] -> Bool
-askFlag i d is  = head $ [ v | SetFlag j v <- is, i == j ] ++ [d]
+askBool :: Bool -> Prelude.Bool -> [Instr] -> Prelude.Bool
+askBool i d is  = head $ [ v | Bool j v <- is, i == j ] ++ [d]
 
-askArgument :: Argument -> Text -> [Instr] -> Text
-askArgument i d is  = head $ [ v | GetArgument j v <- is, i == j ] ++ [d]
+askString :: String -> Prelude.String -> [Instr] -> Prelude.String
+askString i d is  = head $ [ v | String j v <- is, i == j ] ++ [d]
 
-askTheory :: UnderlyingTheory -> [Instr] -> UnderlyingTheory
-askTheory d is = head $ [ t | Theory t <- is] ++ [d]
 
 -- Drop
 
--- | Drop an @Instr@ from the @[Instr]@ (assuming the latter doesn't contain duplicates)
-dropInstr :: Drop -> [Instr] -> [Instr]
-dropInstr (DropCommand m) (Command n : rs) | n == m = rs
-dropInstr (DropLimit m) (LimitBy n _ : rs) | n == m = rs
-dropInstr (DropFlag m) (SetFlag n _ : rs) | n == m = rs
-dropInstr (DropArgument m) (GetArgument n _ : rs) | n == m = rs
-dropInstr i (r : rs)  = r : dropInstr i rs
-dropInstr _ _ = []
+drop :: Drop -> [Instr] -> [Instr]
+drop (DropCommand m) (Command n : rs) | n == m = rs
+drop (DropInt m) (Int n _ : rs) | n == m = rs
+drop (DropBool m) (Bool n _ : rs) | n == m = rs
+drop (DropString m) (String n _ : rs) | n == m = rs
+drop i (r : rs)  = r : drop i rs
+drop _ _ = []
 
 
 -- Keywords
 
-keywordsCommand :: [(Command, Text)]
+keywordsCommand :: [(Command, Prelude.String)]
 keywordsCommand =
  [(EXIT, "exit"),
   (QUIT, "quit"),
@@ -145,15 +140,15 @@ keywordsCommand =
   (FILTER, "filter"),
   (RULES, "rules")]
 
-keywordsLimit :: [(Limit, Text)]
-keywordsLimit =
+keywordsInt :: [(Int, Prelude.String)]
+keywordsInt =
  [(Timelimit, "timelimit"),
   (Depthlimit, "depthlimit"),
   (Checktime, "checktime"),
   (Checkdepth, "checkdepth")]
 
-keywordsFlag :: [(Flag, Text)]
-keywordsFlag =
+keywordsBool :: [(Bool, Prelude.String)]
+keywordsBool =
  [(Prove, "prove"),
   (Check, "check"),
   (Symsign, "symsign"),
@@ -172,26 +167,28 @@ keywordsFlag =
   (Dump, "dump"),
   (Printsimp, "printsimp"),
   (Printthesis, "printthesis"),
+  (Ontored, "ontored"),
   (Unfold, "unfold"),
   (Unfoldsf, "unfoldsf"),
   (Unfoldlow, "unfoldlow"),
   (Unfoldlowsf, "unfoldlowsf"),
+  (Checkontored, "checkontored"),
   (Translation, "translation")]
 
-keywordsArgument :: [(Argument, Text)]
-keywordsArgument =
+keywordsString :: [(String, Prelude.String)]
+keywordsString =
  [(Read, "read"),
   (Library, "library"),
   (Provers, "provers"),
   (Prover, "prover")]
 
-keywordsArguments :: [(Arguments, Text)]
-keywordsArguments =
+keywordsStrings :: [(Strings, Prelude.String)]
+keywordsStrings =
   [(Synonym, "synonym")]
 
--- distiguish between parser and verifier instructions
+-- distiguish between parser and verifier instructions 
 
-isParserInstruction :: Instr -> Bool
+isParserInstruction :: Instr -> Prelude.Bool
 isParserInstruction i = case i of
-  Command EXIT -> True; Command QUIT -> True; GetArgument Read _ -> True;
-  GetArguments Synonym _ -> True; _ -> False
+  Command EXIT -> True; Command QUIT -> True; String Read _ -> True;
+  Strings Synonym _ -> True; _ -> False

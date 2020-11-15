@@ -4,151 +4,103 @@ Authors: Steffen Frerix (2017 - 2018)
 Primitive parsers.
 -}
 
-{-# LANGUAGE OverloadedStrings #-}
 
-module SAD.Parser.Primitives
-  ( tokenPrim
-  , tokenGuard
-  , mapInput
-  , inspectError
-  , satisfy
-  , eof
-  , word
-  , symb
-  , anyToken
-  , symbol
-  , token
-  , token'
-  , tokenPos'
-  , tokenOf
-  , tokenOf'
-  ) where
+
+module SAD.Parser.Primitives where
 
 import SAD.Parser.Base
 import SAD.Parser.Error
 import SAD.Parser.Token
 import SAD.Core.SourcePos
-import SAD.Data.Formula.Show (symChars)
 
-import Data.Char (isAlpha)
+import Data.List (uncons)
+import Data.Char (isAlpha, toLower)
 import Control.Monad (void, guard)
-import Data.Text.Lazy (Text)
-import qualified Data.Text.Lazy as Text
 
 
 -- primitive Token operations
 
--- | Parse the current token or return an @EmptyFail@
--- if the input is empty, eof or the supplied test functions returns @Nothing@.
+---- parse the current token
 tokenPrim :: (Token -> Maybe a) -> Parser st a
 tokenPrim test = Parser $ \(State st input _) ok _ eerr ->
-  case input of
-    []   -> eerr $ unexpectError "" noSourcePos
-    t:ts -> case guard (not $ isEOF t) >> test t of
+  case uncons input of
+    Nothing     -> eerr $ unexpectError "" noPos
+    Just (t,ts) -> case guard (not $ isEOF t) >> test t of
       Just x  ->
         let newstate = State st ts (tokenPos t)
             newerr   = newErrorUnknown $ tokenPos t
-        in  ok newerr [] [PR x newstate]
+        in  seq newstate $ ok newerr [] . pure $ PR x newstate
       Nothing -> eerr $ unexpectError (showToken t) (tokenPos t)
 
-
--- | @tokenGuard test p@ parses the current token using @p@ only if the token passes
--- the predicate @test@. Does not produce particularly useful error messages.
-tokenGuard :: (Token -> Bool) -> Parser st a -> Parser st a
-tokenGuard test p = Parser $ \st@(State _ input _) ok cerr eerr ->
-  case input of
-    []   -> eerr $ unexpectError "" noSourcePos
-    t:ts -> if test t
-      then runParser p st ok cerr eerr
-      else eerr $ unexpectError (showToken t) (tokenPos t)
-
-
--- | Parse the end of input
+---- parse end of input
 eof :: Parser st ()
 eof = Parser $ \(State st input _) ok _ eerr ->
-  case input of
-    [] -> eerr $ unexpectError "" noSourcePos
-    (t:ts) ->
+  case uncons input of
+    Nothing -> eerr $ unexpectError "" noPos
+    Just (t, ts) ->
       if isEOF t
       then
         let newstate = State st ts (tokenPos t)
             newerr   = newErrorUnknown $ tokenPos t
-        in  ok newerr [] [PR () newstate]
+        in  seq newstate $ ok newerr [] . pure $ PR () newstate
       else eerr $ unexpectError (showToken t) (tokenPos t)
 
 
--- | Turn @ParseError@s into valid @ParseResult@s.
+-- error handling outside of the monad
+
 catchError :: (ParseError -> a) -> Parser st a -> Parser st a
-catchError catch p = Parser $ \st ok _cerr _eerr ->
+catchError catch p = Parser $ \st ok cerr eerr ->
   let pcerr err = ok (newErrorUnknown $ stPosition st) [] [PR (catch err) st]
       peerr err = ok (newErrorUnknown $ stPosition st) [PR (catch err) st] []
   in  runParser p st ok pcerr peerr
 
--- | Lift possible parse errors into the @ParseResult@ using @catchError@.
 inspectError :: Parser st a -> Parser st (Either ParseError a)
 inspectError = catchError Left . fmap Right
 
--- | Map a function over the input in the Parser @State@.
-mapInput :: ([Token] -> [Token]) -> Parser st a -> Parser st a
-mapInput jump p = Parser $ \st ok cerr err ->
+jumpWith :: ([Token] -> [Token]) -> Parser st a -> Parser st a
+jumpWith jump p = Parser $ \st ok cerr err ->
   let newInput = jump $ stInput st
   in  runParser p st{stInput = newInput} ok cerr err
 
 -- useful macros
 
--- | Check if the current token satisfies a predicate; if not fail
-satisfy :: (Text -> Bool) -> Parser st Text
+---- check if the current token satisfies a predicate; if not fail
+satisfy :: (String -> Bool) -> Parser st String
 satisfy pr = tokenPrim prTest
   where
-    prTest :: Token -> Maybe Text
-    prTest tk = let s = showToken tk in case pr s of
-      True  -> Just s
-      False -> Nothing
+    prTest tk = let s = showToken tk in guard (pr s) >> return s
 
+---- check if the current token is a word
+word :: Parser st String
+word = satisfy $ \tk -> all isAlpha tk
 
--- | Always succeed and pass on the string of the token
-anyToken :: Parser st Text
-anyToken = tokenPrim (Just . showToken)
+---- check if the current token is equal to s after mapping to lowercase
+{-# INLINE wdToken #-}
+wdToken :: String -> Parser st ()
+wdToken s = void $ satisfy $ \tk -> s == map toLower tk
 
--- | Parses a token that is a word (i.e. consists of only alphabetic characters).
-word :: Parser st Text
-word = satisfy $ \tk -> Text.all isAlpha tk
-
-symb :: Parser st Text
-symb = tokenPrim $ \tok ->
-  let t = showToken tok
-  in case Text.uncons t of
-    Just (c, "") -> guard (c `elem` symChars) >> return t
-    _ -> Nothing
-
-
--- | @token tok@ succeeds iff the current token is equal to @tok@. Consumes the token.
-{-# INLINE token #-}
-token :: Text -> Parser st ()
-token tok = void $ satisfy $ \tok' -> tok == tok'
-
--- | Case-insensitive version of @token@. The argument is assumed to be in folded case.
-{-# INLINE token' #-}
-token' :: Text -> Parser st ()
-token' tok = void $ satisfy $ \tok' -> tok == Text.toCaseFold tok'
-
--- | A version of @token'@ that returns the position of the token instead of @()@.
-tokenPos' :: Text -> Parser st SourcePos
-tokenPos' s = do
+wdTokenPos :: String -> Parser st SourcePos
+wdTokenPos s = do
   pos <- getPos
-  token' s
+  () <- wdToken s
   return pos
 
--- | @tokenOf toks@ succeeds iff the current token is an element of @toks@. Consumes the token.
-tokenOf :: [Text] -> Parser st ()
-tokenOf toks = void $ satisfy $ \tok -> tok `elem` toks
+---- check if the current token is equal to some element of ls after
+---- mapping to lowercase
+{-# INLINE wdTokenOf #-}
+wdTokenOf :: [String] -> Parser st ()
+wdTokenOf ls = void $ satisfy $ \tk -> map toLower tk `elem` ls
 
--- | Case-insensitive version of @tokenOf@. All arguments are assumed to be in folded case.
-{-# INLINE tokenOf' #-}
-tokenOf' :: [Text] -> Parser st ()
-tokenOf' toks = void $ satisfy $ \tok -> Text.toCaseFold tok `elem` toks
+---- check if the current token is equal to s respecting case
+{-# INLINE smTokenOf #-}
+smTokenOf :: String -> Parser st ()
+smTokenOf s = void $ satisfy $ \tk -> s == tk
 
--- | Check if the next tokens are the (case-sensitive) characters
--- of the input string. Useful for parsing symbols.
-symbol :: Text -> Parser st ()
-symbol = mapM_ (token . Text.singleton) . Text.unpack
+---- check if the next tokens form a given symbol
+symbol :: String -> Parser st ()
+symbol []     = return ()
+symbol (c:cs) = smTokenOf [c] >> symbol cs
+
+---- always succeed and pass on the string of the token
+anyToken :: Parser st String
+anyToken = tokenPrim (Just . showToken)

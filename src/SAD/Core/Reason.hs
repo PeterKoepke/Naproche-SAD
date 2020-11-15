@@ -1,17 +1,9 @@
 {-
 Authors: Andrei Paskevich (2001 - 2008), Steffen Frerix (2017 - 2018)
 
-The reasoner handles proof tasks.
-
-Trivial proof tasks can be discharged quickly without calling an external prover.
-Non-trivial proof tasks are exported to an external prover. If the direct proof
-by an external prover fails, the reasoner expands some definitions and tries again.
+Reasoning methods and export to an external prover.
 -}
-
-{-# OPTIONS_GHC -fno-warn-incomplete-patterns #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module SAD.Core.Reason (
   reason,
   withGoal, withContext,
@@ -22,37 +14,40 @@ module SAD.Core.Reason (
   ) where
 -- FIXME reconcept some functions so that this module does not need to export
 --       the small fries anymore
-
-
-import Control.Exception (evaluate)
-import Control.Monad.Reader
-import Data.Maybe (fromJust, fromMaybe, maybeToList)
+import Control.Monad
+import Data.Char
+import Data.List
+import Data.Maybe
+import System.Timeout
+import Control.Exception
 import Data.Monoid (Sum, getSum)
-import System.Timeout (timeout)
-
+import qualified Data.IntMap.Strict as IM
 import qualified Control.Monad.Writer as W
-import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.Text.Lazy as Text
+import qualified Data.Map as M
+import Control.Monad.State
+import Control.Monad.Reader
 import qualified Isabelle.Standard_Thread as Standard_Thread
 
+import SAD.Core.SourcePos
 import SAD.Core.Base
-import SAD.Core.SourcePos (noSourcePos)
-import SAD.Data.Definition
-import SAD.Data.Formula
-import SAD.Data.Instr (Limit(..), Flag(..))
-import SAD.Data.Text.Context (Context(Context))
-import SAD.Data.Text.Decl (newDecl)
-import SAD.Export.Prover (export, Result(..))
-import SAD.Prove.MESON (prove)
-
 import qualified SAD.Core.Message as Message
-import qualified SAD.Data.Definition as Definition
-import qualified SAD.Data.Structures.DisTree as DT
-import qualified SAD.Data.Text.Block as Block
+import SAD.Data.Formula
+import SAD.Data.Instr (Instr)
+import qualified SAD.Data.Instr as Instr
+import SAD.Data.Text.Context (Context(Context))
 import qualified SAD.Data.Text.Context as Context
-
-
+import SAD.Data.Text.Block (Block, Section(..))
+import qualified SAD.Data.Text.Block as Block
+import SAD.Data.Definition (Definitions)
+import qualified SAD.Data.Definition as Definition
+import SAD.Data.Evaluation (Evaluation)
+import qualified SAD.Data.Evaluation as Evaluation
+import SAD.Export.Prover
+import SAD.ForTheL.Base
+import SAD.Prove.MESON
+import qualified SAD.Data.Structures.DisTree as DT
+import qualified SAD.Data.Text.Decl as Decl
 
 -- Reasoner
 
@@ -61,23 +56,19 @@ reason tc = local (\st -> st {currentThesis = tc}) proveThesis
 
 withGoal :: VM a -> Formula -> VM a
 withGoal action goal = local (\vState ->
-  vState { currentThesis = Context.setFormula (currentThesis vState) goal}) action
+  vState { currentThesis = Context.setForm (currentThesis vState) goal}) action
 
 withContext :: VM a -> [Context] -> VM a
-withContext action context = local (\vState ->
+withContext action context = local (\vState -> 
   vState { currentContext = context }) action
 
-thesis :: VM Context
-thesis = asks currentThesis
+thesis = asks currentThesis; context = asks currentContext
 
 
 proveThesis :: VM ()
 proveThesis = do
-  reasoningDepth <- askInstructionInt Depthlimit 3
-  guard (reasoningDepth > 0) -- Fallback to defaulting of the underlying CPS Maybe monad.
-  ctx <- asks currentContext
-  goals <- splitGoal
-  filterContext (sequenceGoals reasoningDepth 0 goals) ctx
+  reasoningDepth <- askInstructionInt Instr.Depthlimit 3;  guard $ reasoningDepth > 0
+  context >>= filterContext (splitGoal >>= sequenceGoals reasoningDepth 0)
 
 sequenceGoals :: Int -> Int -> [Formula] -> VM ()
 sequenceGoals reasoningDepth iteration (goal:restGoals) = do
@@ -88,24 +79,24 @@ sequenceGoals reasoningDepth iteration (goal:restGoals) = do
     trivial = guard (isTop reducedGoal) >> updateTrivialStatistics
     proofByATP = launchProver iteration
 
-    reason = if reasoningDepth == 1
-      then warnDepthExceeded >> mzero
-      else do
-        newTask <- unfold
-        let Context {Context.formula = Not newGoal} : newContext = newTask
-        sequenceGoals (pred reasoningDepth) (succ iteration) [newGoal]
-          `withContext` newContext
+    reason 
+      | reasoningDepth == 1 = depthExceedMessage >> mzero
+      | otherwise = do  
+          newTask <- unfold
+          let Context {Context.formula = Not newGoal} : newContext = newTask
+          sequenceGoals (pred reasoningDepth) (succ iteration) [newGoal]
+            `withContext` newContext
 
-    warnDepthExceeded =
-      whenInstruction Printreason False $
-        reasonLog Message.WARNING noSourcePos "reasoning depth exceeded"
+    depthExceedMessage =
+      whenInstruction Instr.Printreason False $
+        reasonLog Message.WARNING noPos "reasoning depth exceeded"
 
-    updateTrivialStatistics =
-      unless (isTop goal) $ whenInstruction Printreason False $ do
-        reasonLog Message.WRITELN noSourcePos ("trivial: " <> (Text.pack $ show goal))
-        incrementCounter TrivialGoals
+    updateTrivialStatistics = 
+      unless (isTop goal) $ whenInstruction Instr.Printreason False $
+         reasonLog Message.WRITELN noPos ("trivial: " ++ show goal)
+      >> incrementIntCounter TrivialGoals
 
-sequenceGoals _ _ [] = return ()
+sequenceGoals  _ _ _ = return ()
 
 splitGoal :: VM [Formula]
 splitGoal = asks (normalizedSplit . strip . Context.formula . currentThesis)
@@ -121,87 +112,77 @@ splitGoal = asks (normalizedSplit . strip . Context.formula . currentThesis)
 
 launchProver :: Int -> VM ()
 launchProver iteration = do
-  whenInstruction Printfulltask False printTask
-  proverList <- asks provers
-  instrList <- asks instructions
-  goal <- thesis
-  context <- asks currentContext
-  let callATP = justIO $ pure $ export iteration proverList instrList context goal
-  callATP >>= timeWith ProofTimer . justIO >>= guardResult
-  res <- fmap head $ askRS trackers
-  case res of
-    Timer _ time -> do
-      addToTimer SuccessTimer time
-      incrementCounter SuccessfulGoals
-    _ -> error "No matching case in launchProver"
+  reductionSetting <- askInstructionBool Instr.Ontored False
+  whenInstruction Instr.Printfulltask False (printTask reductionSetting)
+  proverList <- asks provers ; instrList <- asks instructions
+  goal <- thesis; context <- context
+  let callATP = justIO $ 
+        export reductionSetting iteration proverList instrList context goal
+  callATP >>= timer ProofTime . justIO >>= guard
+  TimeCounter _ time <- fmap head $ askRS counters
+  addTimeCounter SuccessTime time ; incrementIntCounter SuccessfulGoals
   where
-    printTask = do
-      contextFormulas <- asks $ map Context.formula . reverse . currentContext
+    printTask reductionSetting = do
+      let getFormula = if reductionSetting then Context.reducedFormula else Context.formula
+      contextFormulas <- asks $ map getFormula . reverse . currentContext
       concl <- thesis
-      reasonLog Message.WRITELN noSourcePos $ "prover task:\n" <>
-        Text.concat (map (\form -> "  " <> Text.pack (show form) <> "\n") contextFormulas) <>
-        "  |- " <> (Text.pack (show (Context.formula concl))) <> "\n"
-
-    guardResult Success = pure ()
-    guardResult ContradictoryAxioms = do
-      reasonLog Message.WRITELN noSourcePos $ "Found contradictory axioms. Make sure you are in a proof by contradiction!"
-      mzero
-    guardResult _ = mzero
+      reasonLog Message.WRITELN noPos $ "prover task:\n" ++
+        concatMap (\form -> "  " ++ show form ++ "\n") contextFormulas ++
+        "  |- " ++ show (Context.formula concl) ++ "\n"
 
 
 launchReasoning :: VM ()
 launchReasoning = do
-  goal <- thesis
-  context <- asks currentContext
+  goal <- thesis; context <- context
   skolemInt <- asks skolemCounter
   (mesonPos, mesonNeg) <- asks mesonRules
   let lowlevelContext = takeWhile Context.isLowLevel context
       proveGoal = prove skolemInt lowlevelContext mesonPos mesonNeg goal
-      -- set timelimit to 10^4
+      -- set timelimit to 10^4 
       -- (usually not necessary as max proof depth is limited)
       callOwn = do
         Standard_Thread.expose_stopped
-        timeout (1000) $ evaluate $ proveGoal
+        timeout (10^4) $ evaluate $ proveGoal
   justIO callOwn >>= guard . (==) (Just True)
 
 
 
 -- Context filtering
 
-{- if an explicit list of theorems is given, we set the asks context that
+{- if an explicit list of theorems is given, we set the context to that 
   plus all definitions/sigexts (as they usually import type information that
-  is easily forgotten) and the low level context. Otherwise the whole
+  is easily forgotten) and the low level context. Otherwise the whole 
   context is selected. -}
 filterContext :: VM a -> [Context] -> VM a
 filterContext action context = do
-  link <- asks (Set.fromList . Context.link . currentThesis)
-  if Set.null link
-    then action `withContext`
+  link <- asks (Set.fromList . Context.link . currentThesis);
+  if Set.null link 
+    then action `withContext` 
          (map replaceSignHead $ filter (not . isTop . Context.formula) context)
     else do
-         linkedContext <- retrieveContext link
+         linkedContext <- retrieveContext link 
          action `withContext` (lowlevelContext ++ linkedContext ++ defsAndSigs)
   where
     (lowlevelContext, toplevelContext) = span Context.isLowLevel context
-    defsAndSigs =
-      let defOrSig c = (isDefinitionBlock c || isSignatureBlock c)
+    defsAndSigs = 
+      let defOrSig c = (not . isTop . Context.reducedFormula $ c) 
+                    && (isDefinition c || isSignature c)
       in  map replaceHeadTerm $ filter defOrSig toplevelContext
 
-isDefinitionBlock, isSignatureBlock :: Context -> Bool
-isDefinitionBlock ctx = Block.Definition == Block.kind (Context.head ctx)
-isSignatureBlock  ctx = Block.Signature  == Block.kind (Context.head ctx)
+isDefinition, isSignature :: Context -> Bool
+isDefinition = (==) Definition . Block.kind . Context.head
+isSignature  = (==) Signature  . Block.kind . Context.head
 
 replaceHeadTerm :: Context -> Context
-replaceHeadTerm c = Context.setFormula c $ dive 0 $ Context.formula c
+replaceHeadTerm c = Context.setForm c $ dive 0 $ Context.formula c
   where
-    dive :: Int -> Formula -> Formula
-    dive n (All _ (Imp (Tag HeadTerm Trm {trmName = TermEquality, trmArgs = [_, t]}) f)) =
-      subst t VarEmpty $ inst VarEmpty f
-    dive n (All _ (Iff (Tag HeadTerm eq@Trm {trmName = TermEquality, trmArgs = [_, t]}) f))
-      = And (subst t VarEmpty $ inst VarEmpty f) (All (newDecl VarEmpty) $ Imp f eq)
+    dive n (All _ (Imp (Tag HeadTerm Trm {trName = "=", trArgs = [_, t]}) f)) =
+      subst t "" $ inst "" f
+    dive n (All _ (Iff (Tag HeadTerm eq@Trm {trName = "=", trArgs = [_, t]}) f))
+      = And (subst t "" $ inst "" f) (All (Decl.nonText "") $ Imp f eq)
     dive n (All _ (Imp (Tag HeadTerm Trm{}) Top)) = Top
     dive n (All v f) =
-      bool $ All v $ bind (VarDefault $ Text.pack $ show n) $ dive (succ n) $ inst (VarDefault $ Text.pack $ show n) f
+      bool $ All v $ bind (show n) $ dive (succ n) $ inst (show n) f
     dive n (Imp f g) = bool $ Imp f $ dive n g
     dive _ f = f
 
@@ -209,7 +190,7 @@ replaceHeadTerm c = Context.setFormula c $ dive 0 $ Context.formula c
 some work by only diving into signature extensions and definitions-}
 replaceSignHead :: Context -> Context
 replaceSignHead c
-  | isDefinitionBlock c || isSignatureBlock c = replaceHeadTerm c
+  | isDefinition c || isSignature c = replaceHeadTerm c
   | otherwise = c
 
 
@@ -219,10 +200,10 @@ trivialByEvidence :: Formula -> Bool
 trivialByEvidence f = isTop $ reduceWithEvidence f
 
 reduceWithEvidence :: Formula -> Formula
-reduceWithEvidence t@Trm{trmName = TermEquality} = t -- leave equality untouched
+reduceWithEvidence t@Trm{trName = "="} = t -- leave equality untouched
 reduceWithEvidence l | isLiteral l = -- try to reduce literals
-  fromMaybe l $ msum $ map (lookFor l) (trmArgs $ ltAtomic l)
-reduceWithEvidence f = bool $ mapF reduceWithEvidence $ bool f
+  fromMaybe l $ msum $ map (lookFor l) (trArgs $ ltAtomic l)
+reduceWithEvidence f = bool $ mapF reduceWithEvidence $ bool f 
 
 
 {- lookFor the right evidence -}
@@ -230,11 +211,12 @@ lookFor :: Formula -> Formula -> Maybe Formula
 lookFor _ Ind{} = Nothing -- bound variables have no evidence
 lookFor literal (Tag _ t) = lookFor literal t -- ignore tags
 lookFor literal t =
-  let negatedLiteral = albet $ Not literal
+  let tId = trId (ltAtomic literal)
+      negatedLiteral = albet $ Not literal
   in  checkFor literal negatedLiteral $ trInfo t
   where
     checkFor literal negatedLiteral [] = Nothing
-    checkFor literal negatedLiteral (atomic:rest)
+    checkFor literal negatedLiteral (atomic:rest) 
       | ltTwins literal (replace t ThisT atomic)        = Just Top
       | ltTwins negatedLiteral (replace t ThisT atomic) = Just Bot
       | otherwise = checkFor literal negatedLiteral rest
@@ -243,7 +225,7 @@ lookFor literal t =
 -- unfolding of local properties
 
 data UnfoldState = UF {
-  defs             :: Definitions,
+  defs             :: Definitions, 
   evals            :: DT.DisTree Evaluation,
   unfoldSetting    :: Bool, -- user parameters that control what is unfolded
   unfoldSetSetting :: Bool }
@@ -251,105 +233,96 @@ data UnfoldState = UF {
 
 -- FIXME the reader monad transformer used here is completely superfluous
 unfold :: VM [Context]
-unfold = do
-  thesis <- asks currentThesis
-  context <- asks currentContext
-  let task = Context.setFormula thesis (Not $ Context.formula thesis) : context
-  definitions <- asks definitions
-  evaluations <- asks evaluations
-  generalUnfoldSetting <- askInstructionBool Unfold True
-  lowlevelUnfoldSetting <- askInstructionBool Unfoldlow True
-  generalSetUnfoldSetting <- askInstructionBool Unfoldsf True
-  lowlevelSetUnfoldSetting <- askInstructionBool Unfoldlowsf False
+unfold = do  
+  thesis <- thesis; context <- context
+  let task = Context.setForm thesis (Not $ Context.formula thesis) : context
+  definitions <- asks definitions; evaluations <- asks evaluations
+  generalUnfoldSetting <- askInstructionBool Instr.Unfold True
+  lowlevelUnfoldSetting <- askInstructionBool Instr.Unfoldlow True
+  generalSetUnfoldSetting <- askInstructionBool Instr.Unfoldsf True
+  lowlevelSetUnfoldSetting <- askInstructionBool Instr.Unfoldlowsf False
   guard (generalUnfoldSetting || generalSetUnfoldSetting)
   let ((goal:toUnfold), topLevelContext) = span Context.isLowLevel task
       unfoldState = UF
-        { defs = definitions
-        , evals = evaluations
-        , unfoldSetting = (generalUnfoldSetting    && lowlevelUnfoldSetting)
-        , unfoldSetSetting = (generalSetUnfoldSetting && lowlevelSetUnfoldSetting) }
-      (newLowLevelContext, numberOfUnfolds) =
+        definitions 
+        evaluations
+        (generalUnfoldSetting    && lowlevelUnfoldSetting)
+        (generalSetUnfoldSetting && lowlevelSetUnfoldSetting)
+      (newLowLevelContext, numberOfUnfolds) = 
         W.runWriter $ flip runReaderT unfoldState $
-          liftM2 (:)
+          liftM2 (:) 
             (let localState st = st { -- unfold goal with general settings
                   unfoldSetting    = generalUnfoldSetting,
                   unfoldSetSetting = generalSetUnfoldSetting}
              in  local localState $ unfoldConservative goal)
-            (mapM unfoldConservative toUnfold)
+            (mapM unfoldConservative toUnfold) 
   unfoldLog newLowLevelContext
   when (numberOfUnfolds == 0) $ nothingToUnfold >> mzero
-  addToCounter Unfolds (getSum numberOfUnfolds)
+  addIntCounter Unfolds (getSum numberOfUnfolds)
   return $ newLowLevelContext ++ topLevelContext
   where
     nothingToUnfold =
-      whenInstruction Printunfold False $ reasonLog Message.WRITELN noSourcePos "nothing to unfold"
-
+      whenInstruction Instr.Printunfold False $ reasonLog Message.WRITELN noPos "nothing to unfold"
     unfoldLog (goal:lowLevelContext) =
-      whenInstruction Printunfold False $ reasonLog Message.WRITELN noSourcePos $ "unfold to:\n"
-        <> Text.unlines (reverse $ map ((<>) "  " . Text.pack . show . Context.formula) lowLevelContext)
-        <> "  |- " <> Text.pack (show (neg $ Context.formula goal))
-
-    neg (Not f) = f
-    neg f = f
+      whenInstruction Instr.Printunfold False $ reasonLog Message.WRITELN noPos $ "unfold to:\n"
+        ++ unlines (reverse $ map ((++) "  " . show . Context.formula) lowLevelContext)
+        ++ "  |- " ++ show (neg $ Context.formula goal)
+    neg (Not f) = f; neg f = f
 
 
 {- conservative unfolding of local properties -}
-unfoldConservative :: Context -> ReaderT UnfoldState (W.Writer (Sum Int)) Context
-unfoldConservative toUnfold
-  | isDeclaration toUnfold = pure toUnfold
-  | otherwise = fmap (Context.setFormula toUnfold) $ fill [] (Just True) 0 $ Context.formula toUnfold
+unfoldConservative :: Context
+  -> ReaderT UnfoldState (W.Writer (Sum Int)) Context
+unfoldConservative toUnfold 
+  | isDeclaration toUnfold = return toUnfold
+  | otherwise =
+      fmap (Context.setForm toUnfold) $ fill [] (Just True) 0 $ Context.formula toUnfold
   where
-    fill :: [Formula] -> Maybe Bool -> Int -> Formula -> ReaderT UnfoldState (W.Writer (Sum Int)) Formula
-    fill localContext sign n f
+    fill localContext sign n f 
       | hasDMK f = return f -- check if f has been unfolded already
       | isTrm f  =  fmap reduceWithEvidence $ unfoldAtomic (fromJust sign) f
     -- Iff is changed to double implication -> every position has a polarity
     fill localContext sign n (Iff f g) = fill localContext sign n $ zIff f g
-    fill localContext sign n f = roundFM VarU fill localContext sign n f
+    fill localContext sign n f = roundFM 'u' fill localContext sign n f
 
-    isDeclaration :: Context -> Bool
-    isDeclaration = (==) Block.LowDefinition . Block.kind . Context.head
+    isDeclaration = (==) LowDefinition . Block.kind . Context.head
 
-{- unfold an atomic formula f occurring with polarity sign -}
-unfoldAtomic :: (W.MonadWriter w m, MonadTrans t,
-                 MonadReader UnfoldState (t m), Num w) =>
-                Bool -> Formula -> t m Formula
+{- unfold an atomic formula f occuring with polarity sign -}
 unfoldAtomic sign f = do
   nbs <- localProperties f >>= return . foldr (if sign then And else Or ) marked
   subtermLocalProperties f >>= return . foldr (if sign then And else Imp) nbs
   where
-    -- we mark the term so that it does not get
+    -- we mark the term so that it does not get 
     -- unfolded again in subsequent iterations
     marked = Tag GenericMark f
 
     subtermLocalProperties (Tag GenericMark _) = return [] -- do not expand marked terms
     subtermLocalProperties h = foldFM termLocalProperties h
-    termLocalProperties h =
+    termLocalProperties h = 
       liftM2 (++) (subtermLocalProperties h) (localProperties h)
     localProperties (Tag GenericMark _) = return []
-    localProperties Trm {trmName = TermEquality, trmArgs = [l,r]} =
-      liftM3 (\a b c -> a ++ b ++ c)
+    localProperties Trm {trName = "=", trArgs = [l,r]} =
+      liftM3 (\a b c -> a ++ b ++ c) 
              (definitionalProperties l r)
-             (definitionalProperties r l)
+             (definitionalProperties r l) 
              (extensionalities l r)
   -- we combine definitional information for l, for r and if
   -- we have set equality we also throw in extensionality for sets and if
   -- we have functions we throw in function extensionality
 
-    localProperties t
+    localProperties t 
       | isApplication t || isElem t = setFunDefinitionalProperties t
       | otherwise = definitionalProperties t t
-
+    
     -- return definitional property of f instantiated with g
     definitionalProperties f g = do
       definitions <- asks defs
       let definingFormula = maybeToList $ do
-            id <- guard (isTrm f) >> pure (trmId f)
-            def <- Map.lookup id definitions;
+            id <- tryToGetID f; def <- IM.lookup id definitions;
             -- only unfold a definitions or (a sigext in a positive position)
             guard (sign || Definition.isDefinition def)
-            sb <- match (defTerm def) f
-            let definingFormula = replace (Tag GenericMark g) ThisT $ sb $ defFormula def
+            sb <- match (Definition.term def) f
+            let definingFormula = replace (Tag GenericMark g) ThisT $ sb $ Definition.formula def
         -- substitute the (marked) term
             guard (not . isTop $ definingFormula)
             return definingFormula
@@ -366,44 +339,41 @@ unfoldAtomic sign f = do
       in  lift (W.tell 1) >> return extensionalityFormula
 
     setExtensionality f g =
-      let v = mkVar VarEmpty in mkAll VarEmpty $ Iff (mkElem v f) (mkElem v g)
+      let v = zVar "" in zAll "" $ Iff (zElem v f) (zElem v g)
     funExtensionality f g =
-      let v = mkVar VarEmpty
-      in (domainEquality (mkDom f) (mkDom g)) `And`
-         mkAll VarEmpty (Imp (mkElem v $ mkDom f) $ mkEquality (mkApp f v) (mkApp g v))
-
+      let v = zVar ""
+      in (domainEquality (zDom f) (zDom g)) `And` 
+         zAll "" (Imp (zElem v $ zDom f) $ zEqu (zApp f v) (zApp g v))
+    
     -- depending on the sign we choose the more convenient form of set equality
-    domainEquality =
-      let v = mkVar VarEmpty; sEqu x y = mkAll VarEmpty (Iff (mkElem v x) (mkElem v y))
-      in  if sign then mkEquality else sEqu
+    domainEquality = 
+      let v = zVar ""; sEqu x y = zAll "" (Iff (zElem v x) (zElem v y))
+      in  if sign then zEqu else sEqu 
 
-    setFunDefinitionalProperties t = do
+    setFunDefinitionalProperties t = do 
       evaluations <- asks evals
       let evaluationFormula = maybeToList $
             DT.lookup t evaluations >>= msum . map findev
       unfGuard unfoldSetSetting $
-        unless (null evaluationFormula) (lift $ W.tell 1) >>
+        unless (null evaluationFormula) (lift $ W.tell 1) >> 
         return evaluationFormula
       where
         findev ev = do
-          sb <- match (evaluationTerm ev) t
-          guard (all trivialByEvidence $ map sb $ evaluationConditions ev)
-          return $ replace (Tag GenericMark t) ThisT $ sb $
-            if sign then evaluationPositives ev else evaluationNegatives ev
+          sb <- match (Evaluation.term ev) t
+          guard (all trivialByEvidence $ map sb $ Evaluation.conditions ev)
+          return $ replace (Tag GenericMark t) ThisT $ sb $ 
+            if sign then Evaluation.positives ev else Evaluation.negatives ev
 
     unfGuard unfoldSetting action =
       asks unfoldSetting >>= \p -> if p then action else return []
 
-hasDMK :: Formula -> Bool
 hasDMK (Tag GenericMark _ ) = True
 hasDMK _ = False
 
-setType :: Formula -> Bool
-setType Var {varInfo = info} = any (infoTwins ThisT $ mkSet ThisT) info
-setType Trm {trmInfo = info} = any (infoTwins ThisT $ mkSet ThisT) info
+setType f | hasInfo f = any (infoTwins ThisT $ zSet ThisT) $ trInfo f
 setType _ = False
 
-funType :: Formula -> Bool
-funType Var {varInfo = info} = any (infoTwins ThisT $ mkFun ThisT) info
-funType Trm {trmInfo = info} = any (infoTwins ThisT $ mkFun ThisT) info
+funType f | hasInfo f = any (infoTwins ThisT $ zFun ThisT) $ trInfo f
 funType _ = False
+
+hasInfo f = isTrm f || isVar f

@@ -5,7 +5,7 @@ Extending the language: definitions, signature extensions, pretypings,
 macros and synonyms.
 -}
 
-{-# LANGUAGE OverloadedStrings #-}
+
 
 module SAD.ForTheL.Extension (
   pretypeVariable,
@@ -17,33 +17,36 @@ module SAD.ForTheL.Extension (
 
 import SAD.Core.SourcePos
 import SAD.Data.Formula
-import SAD.Data.Text.Block (ProofText (..))
+import qualified SAD.Data.Instr as Instr
+import SAD.Data.Text.Block (Block, Text (..))
 
 import SAD.ForTheL.Base
 import SAD.ForTheL.Statement
 import SAD.ForTheL.Pattern
+import SAD.ForTheL.Instruction (instrPos)
 import SAD.ForTheL.Reports
 import SAD.Parser.Primitives
 import SAD.Parser.Base
 import SAD.Parser.Combinators
-import SAD.Data.Text.Decl
-import SAD.Core.SourcePos (SourceRange(..))
+import qualified SAD.Data.Text.Decl as Decl
+
 
 import Control.Monad
-import qualified Data.Set as Set
-import Control.Applicative
-import Control.Monad.State.Class (get, modify)
-import Data.Text.Lazy (Text)
-import qualified Data.Text.Lazy as Text
+import Data.Maybe (isNothing, fromJust)
+import qualified Control.Monad.State.Class as MS
+
+
+
+-- for tests
+import SAD.Parser.Token
+import Debug.Trace
+
 
 -- definitions and signature extensions
 
-defExtend :: FTL Formula
-defExtend = defPredicat -|- defNotion
-sigExtend :: FTL Formula
+defExtend = defPredicat -|- defNotion' -|- defNotion
 sigExtend = sigPredicat -|- sigNotion
 
-defPredicat :: FTL Formula
 defPredicat = do
   (f, g) <- wellFormedCheck prdVars defn
   return $ Iff (Tag HeadTerm f) g
@@ -51,9 +54,8 @@ defPredicat = do
     defn = do f <- newPredicat; equiv; g <- statement; return (f,g)
     equiv = iff <|> symbol "<=>"
 
-defNotion :: FTL Formula
 defNotion = do
-  ((n,h),u) <- wellFormedCheck (notionVars . fst) defn; uDecl <- makeDecl u
+  ((n,h),u) <- wellFormedCheck (ntnVars . fst) defn; uDecl <- makeDecl u
   return $ dAll uDecl $ Iff (Tag HeadTerm n) h
   where
     defn = do
@@ -62,25 +64,41 @@ defNotion = do
       h <- (fn . q) <$> dig f [v]
       return ((n,h),u)
 
-    isOrEq = token' "=" <|> isEq
-    isEq   = is >> optLL1 () (token' "equal" >> token' "to")
-    trm Trm {trmName = TermEquality, trmArgs = [_,t]} = t; trm t = t
+    isOrEq = wdToken "=" <|> isEq
+    isEq   = is >> optLL1 () (wdToken "equal" >> wdToken "to")
+    trm Trm {trName = "=", trArgs = [_,t]} = t; trm t = t
+
+defNotion' = do
+  ((n,h),u) <- wellFormedCheck (ntnVars . fst) defn; uDecl <- makeDecl u
+  return $ dAll uDecl $ Iff (Tag HeadTerm n) h
+  where
+    defn = do
+      -- (q, f) <- anotion
+      (q,f,w) <- (art >> gnotion basentn rat <|> fmap digadd primTvr) >>= single
+      is
+      (n, u) <- newNotion
+      iff
+      s <- fmap (Tag Dig) statement
+      let f' = And f s
+      let g = subst zHole (fst w) f'
+      let v = pVar u; fn = replace v (trm n)
+      h <- (fn . q) <$> dig g [v]
+      return ((n,h),u)
+    rat = fmap (Tag Dig) stattr
+    trm Trm {trName = "=", trArgs = [_,t]} = t; trm t = t
 
 
-
-sigPredicat :: FTL Formula
 sigPredicat = do
   (f,g) <- wellFormedCheck prdVars sig
   return $ Imp (Tag HeadTerm f) g
   where
     sig    = do f <- newPredicat; imp; g <- statement </> noInfo; return (f,g)
-    imp    = token' "is" <|> token' "implies" <|> symbol "=>"
-    noInfo = art >> tokenOf' ["atom", "relation"] >> return Top
+    imp    = wdToken "is" <|> wdToken "implies" <|> symbol "=>"
+    noInfo = art >> wdTokenOf ["atom", "relation"] >> return Top
 
 
-sigNotion :: FTL Formula
 sigNotion = do
-  ((n,h),u) <- wellFormedCheck (notionVars . fst) sig; uDecl <- makeDecl u
+  ((n,h),u) <- wellFormedCheck (ntnVars . fst) sig; uDecl <- makeDecl u
   return $ dAll uDecl $ Imp (Tag HeadTerm n) h
   where
     sig = do
@@ -90,107 +108,100 @@ sigNotion = do
       return ((n,h),u)
 
     noInfo =
-      art >> tokenOf' ["notion", "constant"] >> return (id,Top)
-    trm Trm {trmName = TermEquality, trmArgs = [_,t]} = t; trm t = t
+      art >> wdTokenOf ["notion", "constant"] >> return (id,Top)
+    trm Trm {trName = "=", trArgs = [_,t]} = t; trm t = t
 
-newPredicat :: FTL Formula
-newPredicat = do n <- newPrdPattern knownVariable; get >>= addExpr n n True
+newPredicat = do n <- newPrdPattern nvr; MS.get >>= addExpr n n True
 
-newNotion :: FTL (Formula, PosVar)
 newNotion = do
-  (n, u) <- newNotionPattern knownVariable;
-  f <- get >>= addExpr n n True
+  (n, u) <- newNtnPattern nvr;
+  f <- MS.get >>= addExpr n n True
   return (f, u)
 
 -- well-formedness check
 
-funVars, notionVars, prdVars :: (Formula, Formula) -> Maybe Text
+funVars, ntnVars, prdVars :: (Formula, Formula) -> Maybe String
 
 funVars (f, d) | not ifq   = prdVars (f, d)
-               | not idq   = Just $ Text.pack $ "illegal function alias: " ++ show d
-               | otherwise = prdVars (t {trmArgs = v:trmArgs t}, d)
+               | not idq   = Just $ "illegal function alias: " ++ show d
+               | otherwise = prdVars (t {trArgs = v:trArgs t}, d)
   where
-    ifq = isTrm f && trmName f == TermEquality && isTrm t
-    idq = isTrm d && trmName d == TermEquality && not (u `occursIn` p)
-    Trm {trmName = TermEquality, trmArgs = [v, t]} = f
-    Trm {trmName = TermEquality, trmArgs = [u, p]} = d
+    ifq = isEquality f && isTrm t
+    idq = isEquality d && not (occurs u p)
+    Trm {trName = "=", trArgs = [v, t]} = f
+    Trm {trName = "=", trArgs = [u, p]} = d
 
 
-notionVars (f, d) | not isFunction = prdVars (f, d)
-               | otherwise      = prdVars (t {trmArgs = v:vs}, d)
+ntnVars (f, d) | not isFunction = prdVars (f, d)
+               | otherwise      = prdVars (t {trArgs = v:vs}, d)
   where
-    isFunction = isTrm f && trmName f == TermEquality && isTrm t
-    Trm {trmName = TermEquality, trmArgs =  [v,t]} = f
-    Trm {trmArgs = vs} = t
+    isFunction = isEquality f && isTrm t
+    Trm {trName = "=", trArgs =  [v,t]} = f
+    Trm {trArgs = vs} = t
 
 
-prdVars (f, d) | not flat  = Just $ Text.pack $ "compound expression: " ++ show f
-               | otherwise = freeOrOverlapping (fvToVarSet $ free f) d
+prdVars (f, d) | not flat  = return $ "compound expression: " ++ show f
+               | otherwise = overfree (free [] f) d
   where
-    flat      = isTrm f && allDistinctVars (trmArgs f)
+    flat      = isTrm f && allDistinctVars (trArgs f)
 
 
-allDistinctVars :: [Formula] -> Bool
 allDistinctVars = disVs []
   where
-    disVs ls (Var {varName = v@(VarHidden _)} : vs) = notElem v ls && disVs (v:ls) vs
-    disVs ls (Var {varName = v@(VarConstant _)} : vs) = notElem v ls && disVs (v:ls) vs
+    disVs ls (Var {trName = v@('h':_)} : vs) = notElem v ls && disVs (v:ls) vs
+    disVs ls (Var {trName = v@('x':_)} : vs) = notElem v ls && disVs (v:ls) vs
     disVs _ [] = True
     disVs _ _ = False
 
 
 
-pretypeVariable :: FTL (ProofText)
+--- introduce synonyms
+
+
+nonLogicalLanguageExt :: Parser FState Text
+nonLogicalLanguageExt = pretypeVariable </> introduceMacro
+
+
+pretypeVariable :: Parser FState Text
 pretypeVariable = do
   (pos, tv) <- narrow typeVar
-  modify $ upd tv
-  return $ ProofTextPretyping pos (fst tv)
+  MS.modify $ upd tv
+  return $ TextPretyping pos (fst tv)
   where
     typeVar = do
-      pos1 <- getPos; markupToken synonymLet "let"; vs <- varList; standFor
-      when (Set.size vs == 0) $ fail "empty variable list in let binding"
-      (g, pos2) <- wellFormedCheck (freeOrOverlapping mempty . fst) holedNotion
-      let pos = rangePos $ SourceRange pos1 pos2
-      addPretypingReport pos $ map posVarPosition $ Set.toList vs;
+      pos1 <- getPos; markupToken synonymLet "let"; vs@(_:_) <- varlist; standFor;
+      (g, pos2) <- wellFormedCheck (overfree [] . fst) holedNotion
+      let pos = rangePos (pos1, pos2)
+      addPretypingReport pos $ map snd vs; 
       return (pos, (vs, ignoreNames g))
 
     holedNotion = do
       (q, f) <- anotion
-      g <- q <$> dig f [(mkVar (VarHole ""))]
-      SourceRange _ pos2 <- dot
+      g <- q <$> dig f [zHole]
+      (_, pos2) <- dot
       return (g, pos2)
 
-    upd (vs, notion) st = st { tvrExpr = (Set.map posVarName vs, notion) : tvrExpr st }
+    upd (vs, ntn) st = st { tvrExpr = (map fst vs, ntn) : tvrExpr st }
 
 
-introduceMacro :: FTL (ProofText)
+introduceMacro :: Parser FState Text
 introduceMacro = do
-  pos1 <- getPos
-  markupToken macroLet "let"
-  (pos2, (f, g)) <- narrow (prd -|- notion)
-  let pos = rangePos $ SourceRange pos1 pos2
+  pos1 <- getPos; markupToken macroLet "let"
+  (pos2, (f, g)) <- narrow (prd -|- ntn)
+  let pos = rangePos (pos1, pos2)
   addMacroReport pos
-  st <- get
-  addExpr f (ignoreNames g) False st
-  return $ ProofTextMacro pos
+  MS.get >>= addExpr f (ignoreNames g) False
+  return $ TextMacro pos
   where
-    prd, notion :: FTL (SourcePos, (Formula, Formula))
     prd = wellFormedCheck (prdVars . snd) $ do
-      f <- newPrdPattern singleLetterVariable
-      standFor
-      g <- statement
-      SourceRange _ pos2 <- dot
-      return (pos2, (f, g))
-    notion = wellFormedCheck (funVars . snd) $ do
-      (n, u) <- unnamedNotion singleLetterVariable
-      standFor
-      (q, f) <- anotion
-      SourceRange _ pos2 <- dot
-      h <- q <$> dig f [pVar u]
-      return (pos2, (n, h))
+      f <- newPrdPattern avr
+      standFor; g <- statement; (_, pos2) <- dot; return (pos2, (f, g))
+    ntn = wellFormedCheck (funVars . snd) $ do
+      (n, u) <- unnamedNotion avr
+      standFor; (q, f) <- anotion; (_, pos2) <- dot
+      h <- fmap q $ dig f [pVar u]; return (pos2, (n, h))
 
-ignoreNames :: Formula -> Formula
-ignoreNames (All dcl f) = All dcl {declName = VarEmpty} $ ignoreNames f
-ignoreNames (Exi dcl f) = Exi dcl {declName = VarEmpty} $ ignoreNames f
+ignoreNames (All dcl f) = All dcl {Decl.name = ""} $ ignoreNames f
+ignoreNames (Exi dcl f) = Exi dcl {Decl.name = ""} $ ignoreNames f
 ignoreNames f@Trm{}   = f
 ignoreNames f         = mapF ignoreNames f
